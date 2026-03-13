@@ -45,6 +45,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "common/common-target.h"
 #include "omp-general.h"
 #include "omp-offload.h"
+#include "omp-low.h"
 #include "lto-section-names.h"
 #include "gomp-constants.h"
 #include "gimple-pretty-print.h"
@@ -1785,7 +1786,11 @@ default_goacc_fork_join (gcall *ARG_UNUSED (call),
        SETUP - emit 'LHS = *RES_PTR', LHS = NULL
        TEARDOWN - emit '*RES_PTR = VAR'
    If LHS is not NULL
-       emit 'LHS = VAR'   */
+       emit 'LHS = VAR'
+
+   On host (non-ACCEL_COMPILER), gang-level reductions use identity
+   initialization and critical-section-protected atomic combine to
+   support multicore parallelism.  */
 
 void
 default_goacc_reduction (gcall *call)
@@ -1794,28 +1799,90 @@ default_goacc_reduction (gcall *call)
   gimple_stmt_iterator gsi = gsi_for_stmt (call);
   tree lhs = gimple_call_lhs (call);
   tree var = gimple_call_arg (call, 2);
+  int level = TREE_INT_CST_LOW (gimple_call_arg (call, 3));
   gimple_seq seq = NULL;
 
-  if (code == IFN_GOACC_REDUCTION_SETUP
-      || code == IFN_GOACC_REDUCTION_TEARDOWN)
+#ifndef ACCEL_COMPILER
+  /* On host, gang-level reductions need special handling for
+     multicore parallelism: identity init + atomic combine.  */
+  bool gang_multicore = (level == GOMP_DIM_GANG);
+#else
+  bool gang_multicore = false;
+#endif
+
+  if (code == IFN_GOACC_REDUCTION_SETUP)
     {
-      /* Setup and Teardown need to copy from/to the receiver object,
-	 if there is one.  */
       tree ref_to_res = gimple_call_arg (call, 1);
 
       if (!integer_zerop (ref_to_res))
 	{
-	  tree dst = build_simple_mem_ref (ref_to_res);
-	  tree src = var;
-
-	  if (code == IFN_GOACC_REDUCTION_SETUP)
-	    {
-	      src = dst;
-	      dst = lhs;
-	      lhs = NULL;
-	    }
+	  /* SETUP: read initial value from shared memory.  */
+	  tree dst = lhs;
+	  tree src = build_simple_mem_ref (ref_to_res);
 	  gimple_seq_add_stmt (&seq, gimple_build_assign (dst, src));
+	  lhs = NULL;
 	}
+    }
+  else if (code == IFN_GOACC_REDUCTION_INIT && gang_multicore)
+    {
+      /* INIT for gang-level on host: initialize to identity element
+	 so each gang starts with a neutral value.  The reduction
+	 operator's identity (0 for +, -INF for max, etc.) ensures
+	 correct combining across gangs.  */
+      tree op_tree = gimple_call_arg (call, 4);
+      enum tree_code rcode = (enum tree_code) TREE_INT_CST_LOW (op_tree);
+      tree type = TREE_TYPE (var);
+      tree identity = omp_reduction_init_op (gimple_location (call),
+					     rcode, type);
+      if (lhs)
+	{
+	  gimple_seq_add_stmt (&seq, gimple_build_assign (lhs, identity));
+	  lhs = NULL;
+	}
+    }
+  else if (code == IFN_GOACC_REDUCTION_TEARDOWN)
+    {
+      tree ref_to_res = gimple_call_arg (call, 1);
+
+      if (!integer_zerop (ref_to_res) && gang_multicore)
+	{
+	  /* TEARDOWN for gang-level on host: atomically combine
+	     this gang's partial result with the shared result using
+	     a critical section.  */
+	  tree op_tree = gimple_call_arg (call, 4);
+	  enum tree_code rcode
+	    = (enum tree_code) TREE_INT_CST_LOW (op_tree);
+
+	  tree lock_fn
+	    = builtin_decl_explicit (BUILT_IN_GOMP_CRITICAL_START);
+	  tree unlock_fn
+	    = builtin_decl_explicit (BUILT_IN_GOMP_CRITICAL_END);
+
+	  gimple_seq_add_stmt (&seq, gimple_build_call (lock_fn, 0));
+
+	  /* *ref_to_res = OP(*ref_to_res, var)  */
+	  tree mem = build_simple_mem_ref (ref_to_res);
+	  tree tmp = create_tmp_var (TREE_TYPE (var));
+	  gimple_seq_add_stmt (&seq, gimple_build_assign (tmp, mem));
+	  gimple_seq_add_stmt (&seq,
+			       gimple_build_assign (tmp, rcode, tmp, var));
+	  gimple_seq_add_stmt (&seq,
+			       gimple_build_assign (unshare_expr (mem), tmp));
+
+	  gimple_seq_add_stmt (&seq, gimple_build_call (unlock_fn, 0));
+	}
+      else if (!integer_zerop (ref_to_res))
+	{
+	  /* Original serial teardown: plain store.  */
+	  tree dst = build_simple_mem_ref (ref_to_res);
+	  gimple_seq_add_stmt (&seq, gimple_build_assign (dst, var));
+	}
+    }
+  else if (code == IFN_GOACC_REDUCTION_FINI
+	   || (code == IFN_GOACC_REDUCTION_INIT && !gang_multicore)
+	   || code == IFN_GOACC_REDUCTION_SETUP)
+    {
+      /* FINI and non-gang INIT/SETUP: pass through (lhs = var).  */
     }
 
   /* Copy VAR to LHS, if there is an LHS.  */

@@ -5560,6 +5560,16 @@ fold_internal_goacc_dim (const gimple *call)
   tree result = NULL_TREE;
   tree type = TREE_TYPE (gimple_call_lhs (call));
 
+#ifndef ACCEL_COMPILER
+  /* On host, gang dimensions are determined at runtime for multicore
+     parallelism.  Do not fold gang DIM_POS or DIM_SIZE to constants
+     even if the source specifies num_gangs(N), because the runtime
+     may use a different gang count.  Worker/vector can still be
+     folded (always 1 on host).  */
+  if (axis == GOMP_DIM_GANG)
+    return NULL_TREE;
+#endif
+
   switch (gimple_call_internal_fn (call))
     {
     case IFN_GOACC_DIM_POS:

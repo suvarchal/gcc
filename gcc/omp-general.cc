@@ -3673,6 +3673,16 @@ oacc_set_fn_attrib (tree fn, tree clauses, vec<tree> *args)
 
   oacc_replace_fn_attrib (fn, attr);
 
+#ifndef ACCEL_COMPILER
+  /* On host, always pass the gang dimension to the runtime even if
+     it's a compile-time constant (e.g. num_gangs(4)), because the
+     runtime needs the value to determine how many threads to spawn.
+     Without this, constant gang dims are only stored in the function
+     attribute and never reach the runtime.  */
+  if (dims[GOMP_DIM_GANG])
+    non_const |= GOMP_DIM_MASK (GOMP_DIM_GANG);
+#endif
+
   if (non_const)
     {
       /* Push a dynamic argument set.  */
