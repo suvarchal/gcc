@@ -5556,17 +5556,23 @@ static tree
 fold_internal_goacc_dim (const gimple *call)
 {
   int axis = oacc_get_ifn_dim_arg (call);
+
+  /* If axis is not a compile-time constant, cannot fold.  */
+  if (axis < 0)
+    return NULL_TREE;
+
   int size = oacc_get_fn_dim_size (current_function_decl, axis);
   tree result = NULL_TREE;
   tree type = TREE_TYPE (gimple_call_lhs (call));
 
 #ifndef ACCEL_COMPILER
   /* On host, gang dimensions are determined at runtime for multicore
-     parallelism.  Do not fold gang DIM_POS or DIM_SIZE to constants
-     even if the source specifies num_gangs(N), because the runtime
-     may use a different gang count.  Worker/vector can still be
-     folded (always 1 on host).  */
-  if (axis == GOMP_DIM_GANG)
+     parallelism when the gang size is not 1.  Do not fold gang
+     DIM_POS or DIM_SIZE to constants in that case, because the
+     runtime determines the actual gang count.  When gang size is 1
+     (gang-redundant code, set by oacc_validate_dims), folding is
+     safe and preserves single-gang host behavior.  */
+  if (axis == GOMP_DIM_GANG && size != 1)
     return NULL_TREE;
 #endif
 

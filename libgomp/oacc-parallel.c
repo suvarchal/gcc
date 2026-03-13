@@ -253,12 +253,23 @@ GOACC_parallel_keyed (int flags_m, void (*fn) (void *),
 
   /* For LOCAL_DEVICE or host device: call exec_func directly with
      parsed dims.  No memory mapping needed (shared memory).  */
-  if ((flags & GOACC_FLAG_LOCAL_DEVICE)
-      || acc_device_type (acc_dev->type) == acc_device_host)
+  if (flags & GOACC_FLAG_LOCAL_DEVICE)
     {
       goacc_save_and_set_bind (acc_device_host);
       acc_dev->openacc.exec_func (fn, mapnum, hostaddrs, NULL, dims, NULL);
       goacc_restore_bind ();
+      goto out_prof;
+    }
+  else if (acc_device_type (acc_dev->type) == acc_device_host)
+    {
+      acc_dev->openacc.exec_func (fn, mapnum, hostaddrs, NULL, dims, NULL);
+      /* Host always executes synchronously — reset async profiling info
+	 since varargs parsing above may have changed it.  */
+      if (profiling_p)
+	{
+	  prof_info.async = acc_async_sync;
+	  prof_info.async_queue = prof_info.async;
+	}
       goto out_prof;
     }
 

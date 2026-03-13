@@ -199,18 +199,18 @@ host_openacc_exec (void (*fn) (void *),
 {
   unsigned num_gangs = dims ? dims[GOMP_DIM_GANG] : 0;
 
-  /* If gang count is 0 (dynamic), use GOMP_OPENACC_DIM gang value,
-     then fall back to number of available processors.  Controlled by:
-       GOMP_OPENACC_DIM=N::   (gang:worker:vector syntax)
-       num_gangs(N) clause     (in source code)  */
+  /* If gang count is 0 (dynamic), use GOMP_OPENACC_DIM gang value.
+     Default to 1 (serial) to preserve backward compatibility —
+     multicore parallelism is activated by setting GOMP_OPENACC_DIM.
+     This also ensures gang-redundant code (no loop gang) runs
+     with 1 gang, since the compiler does not pass num_gangs()
+     to the runtime for such code.
+     Controlled by:
+       GOMP_OPENACC_DIM=N::   (gang:worker:vector syntax)  */
   if (num_gangs == 0)
     num_gangs = goacc_default_dims[GOMP_DIM_GANG];
   if (num_gangs <= 0)
-    {
-      num_gangs = gomp_icv (false)->nthreads_var;
-      if (num_gangs == 0)
-	num_gangs = 1;
-    }
+    num_gangs = 1;
 
   if (num_gangs == 1)
     {

@@ -1019,6 +1019,20 @@ oacc_validate_dims (tree fn, tree attrs, int *dims, int level, unsigned used)
 	changed = true;
       }
 
+#ifndef ACCEL_COMPILER
+  /* On host, force gang dim to 1 for regions without gang-partitioned
+     code, even if the user specified num_gangs(N).  Gang-redundant
+     execution with multiple gangs would cause each gang to execute
+     the full body redundantly, leading to incorrect results for
+     reductions and side effects.  Only gang-partitioned loops benefit
+     from multicore parallelism.  */
+  if (!(used & GOMP_DIM_MASK (GOMP_DIM_GANG)) && dims[GOMP_DIM_GANG] != 1)
+    {
+      dims[GOMP_DIM_GANG] = 1;
+      changed = true;
+    }
+#endif
+
   if (changed)
     {
       /* Replace the attribute with new values.  */

@@ -28,4 +28,7 @@ f2 (void)
 
   return i + j;
 }
-/* { dg-final { scan-tree-dump-not "if" "cddce2"} } */
+/* On offload targets all dims are constant and all 'if's can be eliminated.
+   On host, gang dim is dynamic for multicore support, so loop bound
+   comparisons against __goacc_host_dim_size remain.  */
+/* { dg-final { scan-tree-dump-not "if" "cddce2" { target { offload_device } } } } */

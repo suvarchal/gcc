@@ -3673,16 +3673,6 @@ oacc_set_fn_attrib (tree fn, tree clauses, vec<tree> *args)
 
   oacc_replace_fn_attrib (fn, attr);
 
-#ifndef ACCEL_COMPILER
-  /* On host, always pass the gang dimension to the runtime even if
-     it's a compile-time constant (e.g. num_gangs(4)), because the
-     runtime needs the value to determine how many threads to spawn.
-     Without this, constant gang dims are only stored in the function
-     attribute and never reach the runtime.  */
-  if (dims[GOMP_DIM_GANG])
-    non_const |= GOMP_DIM_MASK (GOMP_DIM_GANG);
-#endif
-
   if (non_const)
     {
       /* Push a dynamic argument set.  */
@@ -3931,7 +3921,9 @@ oacc_get_fn_dim_size (tree fn, int axis)
 }
 
 /* Extract the dimension axis from an IFN_GOACC_DIM_POS or
-   IFN_GOACC_DIM_SIZE call.  */
+   IFN_GOACC_DIM_SIZE call.  Returns -1 if the argument is not
+   a compile-time constant (can happen when gang dims are dynamic
+   on host for multicore parallelism).  */
 
 int
 oacc_get_ifn_dim_arg (const gimple *stmt)
@@ -3939,6 +3931,10 @@ oacc_get_ifn_dim_arg (const gimple *stmt)
   gcc_checking_assert (gimple_call_internal_fn (stmt) == IFN_GOACC_DIM_SIZE
 		       || gimple_call_internal_fn (stmt) == IFN_GOACC_DIM_POS);
   tree arg = gimple_call_arg (stmt, 0);
+
+  if (TREE_CODE (arg) != INTEGER_CST)
+    return -1;
+
   HOST_WIDE_INT axis = TREE_INT_CST_LOW (arg);
 
   gcc_checking_assert (axis >= 0 && axis < GOMP_DIM_MAX);
