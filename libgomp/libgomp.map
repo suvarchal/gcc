@@ -645,6 +645,12 @@ GOACC_2.0.2 {
 	GOACC_exit_data;
 } GOACC_2.0.1;
 
+GOACC_2.0.3 {
+  global:
+	__goacc_host_dim_pos;
+	__goacc_host_dim_size;
+} GOACC_2.0.2;
+
 GOMP_PLUGIN_1.0 {
   global:
 	GOMP_PLUGIN_malloc;

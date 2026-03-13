@@ -2422,7 +2422,8 @@ execute_oacc_device_lower ()
   return 0;
 }
 
-/* Default launch dimension validator.  Force everything to 1.  A
+/* Default launch dimension validator.  Allow gang parallelism on
+   host for multicore CPU execution, force worker/vector to 1.  A
    backend that wants to provide larger dimensions must override this
    hook.  */
 
@@ -2435,7 +2436,18 @@ default_goacc_validate_dims (tree ARG_UNUSED (decl), int *dims,
 
   for (unsigned ix = 0; ix != GOMP_DIM_MAX; ix++)
     {
-      if (dims[ix] != 1)
+      if (ix == GOMP_DIM_GANG)
+	{
+	  /* Allow gang dim to remain 0 (dynamic, decided at runtime)
+	     or a user-specified positive value for host multicore
+	     execution.  Only clamp negative values to 0.  */
+	  if (dims[ix] < 0)
+	    {
+	      dims[ix] = 0;
+	      changed = true;
+	    }
+	}
+      else if (dims[ix] != 1)
 	{
 	  dims[ix] = 1;
 	  changed = true;
@@ -2445,14 +2457,18 @@ default_goacc_validate_dims (tree ARG_UNUSED (decl), int *dims,
   return changed;
 }
 
-/* Default dimension bound is unknown on accelerator and 1 on host.  */
+/* Default dimension bound is unknown on accelerator and unknown for
+   gang on host (determined at runtime), 1 for worker/vector.  */
 
 int
-default_goacc_dim_limit (int ARG_UNUSED (axis))
+default_goacc_dim_limit (int axis)
 {
 #ifdef ACCEL_COMPILER
   return 0;
 #else
+  /* Gang dimension is dynamic (determined at runtime).  */
+  if (axis == GOMP_DIM_GANG)
+    return 0;
   return 1;
 #endif
 }

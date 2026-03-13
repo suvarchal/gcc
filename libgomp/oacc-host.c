@@ -35,6 +35,59 @@
 
 static struct gomp_device_descr host_dispatch;
 
+/* Thread-local storage for OpenACC gang dimensions on host.
+   These are queried by compiler-generated code via __goacc_host_dim_pos
+   and __goacc_host_dim_size.  Default values (0 and 1) preserve serial
+   behavior for non-threaded execution paths.  */
+static __thread unsigned goacc_host_gang_pos = 0;
+static __thread unsigned goacc_host_gang_size = 1;
+
+/* Query functions called by compiler-generated code (via emit_library_call
+   in internal-fn.cc expand_GOACC_DIM_POS/SIZE).  These return gang
+   position/size from TLS.  Worker and vector dimensions are always
+   0 and 1 respectively (single worker, single vector lane).  */
+unsigned
+__goacc_host_dim_pos (unsigned dim)
+{
+  if (dim == GOMP_DIM_GANG)
+    return goacc_host_gang_pos;
+  return 0;
+}
+
+unsigned
+__goacc_host_dim_size (unsigned dim)
+{
+  if (dim == GOMP_DIM_GANG)
+    return goacc_host_gang_size;
+  return 1;
+}
+
+/* Data passed to the gang worker wrapper function.  */
+struct host_gang_data
+{
+  void (*fn) (void *);
+  void **hostaddrs;
+  unsigned num_gangs;
+};
+
+/* Wrapper function executed by each gang thread.  Sets up TLS with
+   the thread's gang position before calling the outlined function.  */
+static void
+host_gang_worker (void *data)
+{
+  struct host_gang_data *gd = (struct host_gang_data *) data;
+  struct gomp_thread *thr = gomp_thread ();
+
+  goacc_host_gang_pos = thr->ts.team_id;
+  goacc_host_gang_size = gd->num_gangs;
+
+  gd->fn (gd->hostaddrs);
+
+  /* Reset TLS to defaults.  */
+  goacc_host_gang_pos = 0;
+  goacc_host_gang_size = 1;
+}
+
 static const char *
 host_get_name (void)
 {
@@ -141,10 +194,42 @@ host_openacc_exec (void (*fn) (void *),
 		   size_t mapnum __attribute__ ((unused)),
 		   void **hostaddrs,
 		   void **devaddrs __attribute__ ((unused)),
-		   unsigned *dims __attribute__ ((unused)),
+		   unsigned *dims,
 		   void *targ_mem_desc __attribute__ ((unused)))
 {
-  fn (hostaddrs);
+  unsigned num_gangs = dims ? dims[GOMP_DIM_GANG] : 0;
+
+  /* If gang count is 0 (dynamic), use GOMP_OPENACC_DIM gang value,
+     then fall back to number of available processors.  Controlled by:
+       GOMP_OPENACC_DIM=N::   (gang:worker:vector syntax)
+       num_gangs(N) clause     (in source code)  */
+  if (num_gangs == 0)
+    num_gangs = goacc_default_dims[GOMP_DIM_GANG];
+  if (num_gangs <= 0)
+    {
+      num_gangs = gomp_icv (false)->nthreads_var;
+      if (num_gangs == 0)
+	num_gangs = 1;
+    }
+
+  if (num_gangs == 1)
+    {
+      /* Single gang: run directly without threading overhead.  */
+      goacc_host_gang_pos = 0;
+      goacc_host_gang_size = 1;
+      fn (hostaddrs);
+    }
+  else
+    {
+      /* Multiple gangs: spawn threads via GOMP_parallel.  Each thread
+	 sets its TLS gang position before calling the outlined function.  */
+      struct host_gang_data gd;
+      gd.fn = fn;
+      gd.hostaddrs = hostaddrs;
+      gd.num_gangs = num_gangs;
+
+      GOMP_parallel (host_gang_worker, &gd, num_gangs, 0);
+    }
 }
 
 static void
@@ -152,11 +237,12 @@ host_openacc_async_exec (void (*fn) (void *),
 			 size_t mapnum __attribute__ ((unused)),
 			 void **hostaddrs,
 			 void **devaddrs __attribute__ ((unused)),
-			 unsigned *dims __attribute__ ((unused)),
+			 unsigned *dims,
 			 void *targ_mem_desc __attribute__ ((unused)),
 			 struct goacc_asyncqueue *aq __attribute__ ((unused)))
 {
-  fn (hostaddrs);
+  /* Host async is synchronous; delegate to the sync version.  */
+  host_openacc_exec (fn, mapnum, hostaddrs, devaddrs, dims, targ_mem_desc);
 }
 
 static int

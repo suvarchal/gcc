@@ -3538,7 +3538,10 @@ expand_ACCESS_WITH_SIZE (internal_fn, gcall *stmt)
     expand_assignment (lhs, ref_to_obj, false);
 }
 
-/* The size of an OpenACC compute dimension.  */
+/* The size of an OpenACC compute dimension.  For targets without
+   a specific oacc_dim_size pattern (i.e. host CPU), call a libgomp
+   runtime function that returns the dimension from thread-local
+   storage, enabling host multicore parallelism.  */
 
 static void
 expand_GOACC_DIM_SIZE (internal_fn, gcall *stmt)
@@ -3556,10 +3559,24 @@ expand_GOACC_DIM_SIZE (internal_fn, gcall *stmt)
       emit_insn (targetm.gen_oacc_dim_size (target, dim));
     }
   else
-    emit_move_insn (target, GEN_INT (1));
+    {
+      /* Call __goacc_host_dim_size(dim) from libgomp.  Returns the
+	 gang/worker/vector size from TLS, defaulting to 1.  */
+      rtx dim = expand_expr (gimple_call_arg (stmt, 0), NULL_RTX,
+			     VOIDmode, EXPAND_NORMAL);
+      rtx func = init_one_libfunc ("__goacc_host_dim_size");
+      rtx val = emit_library_call_value (func, target, LCT_PURE,
+					 TYPE_MODE (integer_type_node),
+					 dim, TYPE_MODE (integer_type_node));
+      if (val != target)
+	emit_move_insn (target, val);
+    }
 }
 
-/* The position of an OpenACC execution engine along one compute axis.  */
+/* The position of an OpenACC execution engine along one compute axis.
+   For targets without a specific oacc_dim_pos pattern (i.e. host CPU),
+   call a libgomp runtime function that returns the position from
+   thread-local storage.  */
 
 static void
 expand_GOACC_DIM_POS (internal_fn, gcall *stmt)
@@ -3577,7 +3594,18 @@ expand_GOACC_DIM_POS (internal_fn, gcall *stmt)
       emit_insn (targetm.gen_oacc_dim_pos (target, dim));
     }
   else
-    emit_move_insn (target, const0_rtx);
+    {
+      /* Call __goacc_host_dim_pos(dim) from libgomp.  Returns the
+	 gang/worker/vector position from TLS, defaulting to 0.  */
+      rtx dim = expand_expr (gimple_call_arg (stmt, 0), NULL_RTX,
+			     VOIDmode, EXPAND_NORMAL);
+      rtx func = init_one_libfunc ("__goacc_host_dim_pos");
+      rtx val = emit_library_call_value (func, target, LCT_PURE,
+					 TYPE_MODE (integer_type_node),
+					 dim, TYPE_MODE (integer_type_node));
+      if (val != target)
+	emit_move_insn (target, val);
+    }
 }
 
 /* This is expanded by oacc_device_lower pass.  */

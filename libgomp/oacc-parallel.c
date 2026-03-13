@@ -182,12 +182,8 @@ GOACC_parallel_keyed (int flags_m, void (*fn) (void *),
 
   handle_ftn_pointers (mapnum, hostaddrs, sizes, kinds);
 
-  /* Host fallback if "if" clause is false or if the current device is set to
-     the host.  */
-  if ((flags & GOACC_FLAG_HOST_FALLBACK)
-      /* TODO: a proper pthreads based "multi-core CPU" local device
-	 implementation. Currently, this is still the same as host-fallback.  */
-      || (flags & GOACC_FLAG_LOCAL_DEVICE))
+  /* Host fallback if "if" clause is false — always serial.  */
+  if (flags & GOACC_FLAG_HOST_FALLBACK)
     {
       prof_info.device_type = acc_device_host;
       api_info.device_type = prof_info.device_type;
@@ -196,11 +192,9 @@ GOACC_parallel_keyed (int flags_m, void (*fn) (void *),
       goacc_restore_bind ();
       goto out_prof;
     }
-  else if (acc_device_type (acc_dev->type) == acc_device_host)
-    {
-      fn (hostaddrs);
-      goto out_prof;
-    }
+
+  /* For LOCAL_DEVICE or acc_device_host: parse dims and route through
+     exec_func for potential multicore parallelism.  */
 
   /* Default: let the runtime choose.  */
   for (i = 0; i != GOMP_DIM_MAX; i++)
@@ -256,7 +250,18 @@ GOACC_parallel_keyed (int flags_m, void (*fn) (void *),
 	}
     }
   va_end (ap);
-  
+
+  /* For LOCAL_DEVICE or host device: call exec_func directly with
+     parsed dims.  No memory mapping needed (shared memory).  */
+  if ((flags & GOACC_FLAG_LOCAL_DEVICE)
+      || acc_device_type (acc_dev->type) == acc_device_host)
+    {
+      goacc_save_and_set_bind (acc_device_host);
+      acc_dev->openacc.exec_func (fn, mapnum, hostaddrs, NULL, dims, NULL);
+      goacc_restore_bind ();
+      goto out_prof;
+    }
+
   if (!(acc_dev->capabilities & GOMP_OFFLOAD_CAP_NATIVE_EXEC))
     {
       k.host_start = (uintptr_t) fn;
