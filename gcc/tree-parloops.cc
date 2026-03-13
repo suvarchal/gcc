@@ -3226,7 +3226,8 @@ gather_scalar_reductions (loop_p loop, reduction_info_table_type *reduction_list
 /* Try to initialize NITER for code generation part.  */
 
 static bool
-try_get_loop_niter (loop_p loop, class tree_niter_desc *niter)
+try_get_loop_niter (loop_p loop, class tree_niter_desc *niter,
+		    bool oacc_kernels_p = false)
 {
   edge exit = single_dom_exit (loop);
 
@@ -3237,6 +3238,21 @@ try_get_loop_niter (loop_p loop, class tree_niter_desc *niter)
      the loop.  */
   if (!number_of_iterations_exit (loop, exit, niter, false))
     {
+      /* For OpenACC kernels, try with assumptions.  Fortran DO loops and
+	 C for-loops with runtime bounds (e.g. do i=1,n) produce niter
+	 expressions that are valid at runtime but have compile-time
+	 assumptions.  This allows parallelization of loops that NVIDIA's
+	 compiler handles but GCC's parloops previously rejected.  */
+      if (oacc_kernels_p
+	  && number_of_iterations_exit_assumptions (loop, exit, niter,
+						    NULL, true))
+	{
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    fprintf (dump_file,
+		     "  niter with assumptions for oacc kernels\n");
+	  return true;
+	}
+
       if (dump_file && (dump_flags & TDF_DETAILS))
 	fprintf (dump_file, "  FAILED: number of iterations not known\n");
       return false;
@@ -3925,7 +3941,7 @@ parallelize_loops (bool oacc_kernels_p)
 	      || optimize_loop_nest_for_size_p (loop)))
 	continue;
 
-      if (!try_get_loop_niter (loop, &niter_desc))
+      if (!try_get_loop_niter (loop, &niter_desc, oacc_kernels_p))
 	continue;
 
       if (!try_create_reduction_list (loop, &reduction_list, oacc_kernels_p))
