@@ -1464,16 +1464,74 @@ vect_analyze_loop_form (class loop *loop, gimple *loop_vectorized_call,
 
   /* Check if we have any control flow that doesn't leave the loop.  */
   basic_block *bbs = get_loop_body (loop);
+  basic_block cfg_reject_bb = NULL;
   for (unsigned i = 0; i < loop->num_nodes; i++)
     if (EDGE_COUNT (bbs[i]->succs) != 1
 	&& (EDGE_COUNT (bbs[i]->succs) != 2
 	    || !loop_exits_from_bb_p (bbs[i]->loop_father, bbs[i])))
       {
-	free (bbs);
-	return opt_result::failure_at (vect_location,
-				       "not vectorized:"
-				       " unsupported control flow in loop.\n");
+	cfg_reject_bb = bbs[i];
+	break;
       }
+  if (cfg_reject_bb)
+    {
+      /* Before emitting the generic control-flow rejection, see whether
+	 the outer loop contains an inner loop whose trip count is
+	 invariant in the outer loop.  This is the specific pattern
+	 (e.g., Fortran   do i ... ; do r = 1, runtime_bound ; ...)
+	 that a future phase of outer-loop vectorization can support.
+	 Emit a diagnostic note identifying it so the pattern is visible
+	 in -fopt-info-vec-missed output.  Behaviour is unchanged: we
+	 still fail here.  */
+      if (dump_enabled_p () && loop->inner)
+	for (class loop *inner = loop->inner; inner; inner = inner->next)
+	  {
+	    bool inner_invariant = false;
+	    tree niter = number_of_latch_executions (inner);
+	    if (niter != NULL_TREE
+		&& !chrec_contains_undetermined (niter)
+		&& expr_invariant_in_loop_p (loop, niter))
+	      inner_invariant = true;
+	    else
+	      {
+		/* SCEV could not fold the trip count (e.g., a runtime-variable
+		   Fortran argument).  Fall back to inspecting the inner
+		   loop's exit condition: if either operand of the exit
+		   condition is outer-invariant it is the loop bound (the
+		   other operand is the induction variable), so the inner
+		   loop executes the same number of iterations on each outer
+		   iteration.  */
+		edge inner_exit = single_exit (inner);
+		if (inner_exit)
+		  {
+		    gcond *cond
+		      = safe_dyn_cast <gcond *>
+			  (gsi_stmt (gsi_last_bb (inner_exit->src)));
+		    if (cond
+			&& (expr_invariant_in_loop_p (loop,
+						      gimple_cond_lhs (cond))
+			    || expr_invariant_in_loop_p (loop,
+							 gimple_cond_rhs
+							   (cond))))
+		      inner_invariant = true;
+		  }
+	      }
+	    if (inner_invariant)
+	      {
+		dump_printf_loc (MSG_MISSED_OPTIMIZATION | MSG_PRIORITY_USER_FACING,
+				 vect_location,
+				 "outer loop contains inner loop with"
+				 " outer-invariant trip count; candidate"
+				 " for outer-loop vectorization but"
+				 " currently unsupported.\n");
+		break;
+	      }
+	  }
+      free (bbs);
+      return opt_result::failure_at (vect_location,
+				     "not vectorized:"
+				     " unsupported control flow in loop.\n");
+    }
 
   /* Check if we have any control flow that doesn't leave the loop.  */
   bool has_phi = false;
