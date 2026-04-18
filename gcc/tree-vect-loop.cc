@@ -1462,14 +1462,67 @@ vect_analyze_loop_form (class loop *loop, gimple *loop_vectorized_call,
 		       "using as main loop exit: %d -> %d [AUX: %p]\n",
 		       exit_e->src->index, exit_e->dest->index, exit_e->aux);
 
-  /* Check if we have any control flow that doesn't leave the loop.  */
+  /* Check if we have any control flow that doesn't leave the loop.
+     When the loop contains an inner loop, two patterns are safely
+     accepted here (the subsequent nested-loop analysis validates that
+     the inner loop itself is well-formed and has an outer-invariant
+     trip count):
+
+       (a) the BB belongs to an inner loop — its two successors form
+	   the inner loop's own back-edge/exit and are validated later;
+
+       (b) the BB belongs to the outer loop and one of its successors
+	   enters an inner loop — a guard BB inserted (for example by
+	   the Fortran front end) around a do r = 1, N loop with a
+	   runtime N that may execute zero iterations.  */
   basic_block *bbs = get_loop_body (loop);
   basic_block cfg_reject_bb = NULL;
+  bool relaxed_cf_for_inner_loop = false;
   for (unsigned i = 0; i < loop->num_nodes; i++)
     if (EDGE_COUNT (bbs[i]->succs) != 1
 	&& (EDGE_COUNT (bbs[i]->succs) != 2
 	    || !loop_exits_from_bb_p (bbs[i]->loop_father, bbs[i])))
       {
+	if (loop->inner)
+	  {
+	    /* Case (a): BB lives inside an inner loop.  */
+	    if (bbs[i]->loop_father != loop
+		&& flow_loop_nested_p (loop, bbs[i]->loop_father))
+	      {
+		relaxed_cf_for_inner_loop = true;
+		continue;
+	      }
+
+	    /* Case (b): BB is a guard for an inner loop — one of its
+	       successors is the preheader or header of an inner loop,
+	       or already inside an inner loop.  */
+	    bool guards_inner_loop = false;
+	    for (class loop *inner = loop->inner;
+		 inner && !guards_inner_loop;
+		 inner = inner->next)
+	      {
+		edge pre_e = loop_preheader_edge (inner);
+		basic_block preheader_bb = pre_e ? pre_e->src : NULL;
+		edge e;
+		edge_iterator ei;
+		FOR_EACH_EDGE (e, ei, bbs[i]->succs)
+		  if ((preheader_bb && e->dest == preheader_bb)
+		      || e->dest == inner->header
+		      || (e->dest->loop_father != loop
+			  && flow_loop_nested_p (loop,
+						 e->dest->loop_father)))
+		    {
+		      guards_inner_loop = true;
+		      break;
+		    }
+	      }
+	    if (guards_inner_loop)
+	      {
+		relaxed_cf_for_inner_loop = true;
+		continue;
+	      }
+	  }
+
 	cfg_reject_bb = bbs[i];
 	break;
       }
@@ -1590,12 +1643,54 @@ vect_analyze_loop_form (class loop *loop, gimple *loop_vectorized_call,
 				       " multiple nested loops.\n");
 
       entryedge = loop_preheader_edge (innerloop);
-      if (entryedge->src != loop->header
-	  || !single_exit (innerloop)
-	  || single_exit (innerloop)->dest != EDGE_PRED (loop->latch, 0)->src)
+      if (!single_exit (innerloop))
 	return opt_result::failure_at (vect_location,
 				       "not vectorized:"
 				       " unsupported outerloop form.\n");
+
+      /* The canonical form has the inner loop preheader driven directly
+	 by loop->header, and the inner loop exit flowing directly into
+	 the BB immediately before loop->latch:
+
+		header ──→ inner-preheader ──→ inner ──→ before-latch ──→ latch
+
+	 A runtime-bounded inner loop (e.g. Fortran do r = 1, N with a
+	 runtime N) may have a guard BB between header and the inner
+	 preheader, plus a merge BB between the inner exit and before-latch:
+
+		header ──→ guard ──┬──→ inner-preheader ──→ inner ──→ merge ──→ before-latch ──→ latch
+				    └────────────────────────────────────↗
+
+	 Accept this guarded form.  We require that walking backward
+	 from the inner preheader through single-pred BBs leads to
+	 loop->header, and walking forward from the inner exit
+	 destination through single-succ BBs leads to the outer
+	 latch's unique predecessor (or already is it).  */
+      basic_block inner_exit_dest = single_exit (innerloop)->dest;
+      basic_block before_latch = EDGE_PRED (loop->latch, 0)->src;
+
+      basic_block src = entryedge->src;
+      while (src != loop->header
+	     && src != loop->latch
+	     && single_pred_p (src)
+	     && single_pred (src)->loop_father == loop)
+	src = single_pred (src);
+
+      basic_block dst = inner_exit_dest;
+      while (dst != before_latch
+	     && dst != loop->latch
+	     && single_succ_p (dst)
+	     && single_succ (dst)->loop_father == loop)
+	dst = single_succ (dst);
+
+      if (src != loop->header || dst != before_latch)
+	return opt_result::failure_at (vect_location,
+				       "not vectorized:"
+				       " unsupported outerloop form.\n");
+
+      if (entryedge->src != loop->header
+	  || inner_exit_dest != before_latch)
+	relaxed_cf_for_inner_loop = true;
 
       /* Analyze the inner-loop.  */
       vect_loop_form_info inner;
@@ -1614,15 +1709,78 @@ vect_analyze_loop_form (class loop *loop, gimple *loop_vectorized_call,
 	return opt_result::failure_at (vect_location,
 				       "not vectorized: Bad inner loop.\n");
 
-      if (inner.number_of_iterations ==  chrec_dont_know
+      if (inner.number_of_iterations == chrec_dont_know
 	  || !expr_invariant_in_loop_p (loop, inner.number_of_iterations))
-	return opt_result::failure_at (vect_location,
-				       "not vectorized: inner-loop count not"
-				       " invariant.\n");
+	{
+	  /* SCEV could not prove the inner trip count is outer-invariant.
+	     This is the common case when a Fortran do r = 1, N uses a
+	     runtime-variable N that is nevertheless a subroutine argument
+	     (or any other value that cannot change inside the outer
+	     loop).  Accept the pattern when all of:
+
+	       1. one operand of the inner exit condition is outer-invariant
+		  (the bound);
+	       2. the other operand is an SSA name defined by a PHI in the
+		  inner header (a proper scalar IV, not a memory-based
+		  recurrence);
+	       3. that PHI's initial value on the inner preheader edge is
+		  outer-invariant, so the inner loop starts in the same
+		  state on every outer iteration.
+
+	     Together these imply the inner loop executes the same number
+	     of iterations on each outer-loop iteration.  */
+	  bool cond_outer_invariant = false;
+	  edge inner_exit_e = single_exit (innerloop);
+	  edge inner_pre_e = loop_preheader_edge (innerloop);
+	  if (inner_exit_e && inner_pre_e)
+	    {
+	      gcond *cond
+		= safe_dyn_cast <gcond *>
+		    (gsi_stmt (gsi_last_bb (inner_exit_e->src)));
+	      if (cond)
+		{
+		  tree lhs = gimple_cond_lhs (cond);
+		  tree rhs = gimple_cond_rhs (cond);
+		  bool lhs_inv = expr_invariant_in_loop_p (loop, lhs);
+		  bool rhs_inv = expr_invariant_in_loop_p (loop, rhs);
+		  tree iv_op = NULL_TREE;
+		  if (rhs_inv && !lhs_inv)
+		    iv_op = lhs;
+		  else if (lhs_inv && !rhs_inv)
+		    iv_op = rhs;
+
+		  if (iv_op && TREE_CODE (iv_op) == SSA_NAME)
+		    {
+		      gimple *def = SSA_NAME_DEF_STMT (iv_op);
+		      gphi *iv_phi = safe_dyn_cast <gphi *> (def);
+		      if (iv_phi
+			  && gimple_bb (iv_phi) == innerloop->header)
+			{
+			  tree iv_init
+			    = PHI_ARG_DEF_FROM_EDGE (iv_phi, inner_pre_e);
+			  if (iv_init != NULL_TREE
+			      && expr_invariant_in_loop_p (loop, iv_init))
+			    cond_outer_invariant = true;
+			}
+		    }
+		}
+	    }
+
+	  if (!cond_outer_invariant)
+	    return opt_result::failure_at (vect_location,
+					   "not vectorized: inner-loop count"
+					   " not invariant.\n");
+	  relaxed_cf_for_inner_loop = true;
+	}
 
       if (dump_enabled_p ())
         dump_printf_loc (MSG_NOTE, vect_location,
 			 "Considering outer-loop vectorization.\n");
+      if (dump_enabled_p () && relaxed_cf_for_inner_loop)
+	dump_printf_loc (MSG_NOTE | MSG_PRIORITY_USER_FACING, vect_location,
+			 "accepted outer loop with inner-loop back-edge"
+			 " / guard control flow (relaxed for"
+			 " outer-invariant inner-loop pattern).\n");
       info->inner_loop_cond = inner.conds[0];
     }
 
