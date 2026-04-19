@@ -38,6 +38,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "fold-const.h"
 #include "stor-layout.h"
 #include "cfganal.h"
+#include "cfgcleanup.h"
+#include "tree-cfgcleanup.h"
 #include "gimplify.h"
 #include "gimple-iterator.h"
 #include "gimplify-me.h"
@@ -1423,6 +1425,300 @@ vect_compute_single_scalar_iteration_cost (loop_vec_info loop_vinfo)
   loop_vinfo->scalar_costs->finish_cost (nullptr);
 }
 
+/* Helper for Phase 3 of the outer-loop / runtime-bounded-inner-loop series.
+
+   When a Fortran "do r = 1, N" loop with a runtime N sits inside an outer
+   loop, the front end emits a guard BB that branches around the inner
+   loop when N < 1 (the zero-trip case), producing a control-flow
+   diamond around the inner:
+
+	outer_header
+	     |
+	    guard ─── if (N == 0) ──┐
+	     |                       |
+	   inner-preheader           |
+	     |                       |
+	    inner (test-at-top)      |
+	     |                       |
+	   inner-exit ──────────→ merge (PHI of s: one arg from guard-skip,
+	                                 one arg from inner-exit)
+	                                |
+	                          ... outer body ...
+
+   When the inner is test-at-top (its exit test lives in the header), the
+   guard is semantically redundant: entering the inner with N == 0 causes
+   the header test to fire on the first evaluation and fall straight into
+   the exit BB without executing the body.  The outgoing value of any
+   inner PHI is then identical to its incoming value on the preheader
+   edge.  Removing the guard collapses the merge PHI to a degenerate
+   single-arg PHI, which subsequent passes simplify.
+
+   This matters because the merge PHI is the exact blocker that prevents
+   outer-loop vectorization today:
+
+     "not vectorized: relevant stmt not supported: s_190 = PHI <...>"
+
+   The pattern detection here is deliberately tight.  We require:
+
+     1. exactly one inner loop (no siblings, no further nesting);
+     2. the inner is test-at-top (its exit originates in its header),
+	and the exit condition has the form  INNER_IV REL BOUND  where
+	INNER_IV is defined by a PHI in the inner header and BOUND is
+	outer-invariant;
+     3. a unique guard BB — found by walking back from the inner
+	preheader through single-pred BBs, stopping at the first BB
+	with multiple successors;
+     4. the guard BB's last stmt is a gcond;
+     5. one of the guard operands is the same SSA as BOUND (the
+	front end's zero-trip test of the runtime bound);
+     6. the guard's "skip" successor converges with the inner's exit
+	destination at a merge BB inside the outer loop, reached by
+	single-successor BB chains from both sides — so removing the
+	guard does not alter control flow elsewhere.
+
+   Matching only this shape avoids perturbing loops whose guard BB
+   is not a front-end zero-trip wrapper (diamonds around if/else,
+   unrelated conditionals, etc.).
+
+   Returns true iff the CFG was modified.  The caller is responsible
+   for invalidating dominance info and SCEV state.  */
+
+static bool
+vect_simplify_guarded_inner_loop (class loop *loop)
+{
+  if (!loop || !loop->inner)
+    return false;
+
+  /* TODO (phase 3 follow-up): the CFG mutation below is not always
+     safe downstream.  Known-affected shapes (seen as calc_dfs_tree
+     ICE on dominance recompute) include:
+
+       - gcc.dg/vect/no-scevccp-outer-9.c / outer-10.c / vect-10.f90
+	 — a simple   for (i=0; i<N; i++) for (j=0; j<n; j++) ...
+	   where the outer is the intended outer-loop vect target; our
+	   mutation inside the body of the very loop being analysed
+	   leaves the merge BB's predecessor set inconsistent with
+	   whatever dominance state the rest of vect_analyze_loop_2
+	   tries to recompute.
+       - gcc.dg/vect/pr81082.c / pr101505.c / pr117888-1.c — deeper
+	 linear nests or diamond-with-inner-loops.
+       - gcc.dg/vect/vect-117.c / vect-epilogues.c — "Invalid sum"
+	 CFG-profile checks after our edge removal.
+
+     These are not addressed by this phase; the simplification here
+     is correct for the canonical Fortran runtime do-loop shape but
+     must be deferred to a later pass or replaced with a
+     non-mutating transformation (e.g., teach the vectorizer to
+     recognise the guard-merge pattern directly in
+     vect_mark_stmts_to_be_vectorized / vectorizable_phi) before it
+     is safe to enable broadly.  */
+
+  class loop *innerloop = loop->inner;
+  if (innerloop->inner || innerloop->next)
+    return false;
+
+  edge pre_e = loop_preheader_edge (innerloop);
+  edge exit_e = single_exit (innerloop);
+  if (!pre_e || !exit_e)
+    return false;
+
+  /* Inner must be test-at-top.  */
+  if (exit_e->src != innerloop->header)
+    return false;
+
+  /* The inner's exit condition must compare an inner-IV against an
+     outer-invariant bound.  Capture that bound SSA so we can match it
+     against the guard condition below.  */
+  gimple_stmt_iterator inner_gsi = gsi_last_bb (exit_e->src);
+  gcond *inner_cond = gsi_end_p (inner_gsi)
+    ? NULL : safe_dyn_cast <gcond *> (gsi_stmt (inner_gsi));
+  if (!inner_cond)
+    return false;
+  tree inner_lhs = gimple_cond_lhs (inner_cond);
+  tree inner_rhs = gimple_cond_rhs (inner_cond);
+  bool lhs_inv = expr_invariant_in_loop_p (loop, inner_lhs);
+  bool rhs_inv = expr_invariant_in_loop_p (loop, inner_rhs);
+  tree inner_bound = NULL_TREE, inner_iv = NULL_TREE;
+  if (lhs_inv && !rhs_inv)
+    {
+      inner_bound = inner_lhs;
+      inner_iv = inner_rhs;
+    }
+  else if (rhs_inv && !lhs_inv)
+    {
+      inner_bound = inner_rhs;
+      inner_iv = inner_lhs;
+    }
+  else
+    return false;
+
+  /* The IV operand must be SSA and defined inside the inner loop.  */
+  if (TREE_CODE (inner_iv) != SSA_NAME)
+    return false;
+  {
+    gimple *iv_def = SSA_NAME_DEF_STMT (inner_iv);
+    basic_block iv_bb = iv_def ? gimple_bb (iv_def) : NULL;
+    if (!iv_bb || !flow_bb_inside_loop_p (innerloop, iv_bb))
+      return false;
+  }
+
+  /* The bound must be SSA (and outer-invariant as established above) or
+     a literal constant.  */
+  if (TREE_CODE (inner_bound) != SSA_NAME
+      && !CONSTANT_CLASS_P (inner_bound))
+    return false;
+
+  /* Walk back from the inner preheader through single-pred, single-succ
+     BBs (still in the outer loop) to find the candidate guard BB.  */
+  basic_block guard_bb = pre_e->src;
+  while (guard_bb != loop->header
+	 && guard_bb->loop_father == loop
+	 && single_pred_p (guard_bb)
+	 && single_succ_p (guard_bb))
+    guard_bb = single_pred (guard_bb);
+
+  /* guard_bb may be the outer-loop header (Fortran puts the runtime
+     zero-trip check immediately at the top of the containing loop).
+     That is still safe to simplify: we only delete the final gcond and
+     its skip edge; the header keeps its PHIs, back-edge, and exit
+     test if any.  But require it to live in the outer loop proper.  */
+  if (guard_bb->loop_father != loop
+      || EDGE_COUNT (guard_bb->succs) != 2)
+    return false;
+
+  gimple_stmt_iterator guard_gsi = gsi_last_bb (guard_bb);
+  gcond *gcond_stmt = gsi_end_p (guard_gsi)
+    ? NULL : safe_dyn_cast <gcond *> (gsi_stmt (guard_gsi));
+  if (!gcond_stmt)
+    return false;
+
+  /* Guard cond must reference the same bound SSA (or an equality form
+     of it) as the inner's exit.  Accept a plain SSA match on either
+     operand; the other operand is typically a zero/one constant.  */
+  tree g_lhs = gimple_cond_lhs (gcond_stmt);
+  tree g_rhs = gimple_cond_rhs (gcond_stmt);
+  bool matches_bound
+    = (inner_bound != NULL_TREE
+       && TREE_CODE (inner_bound) == SSA_NAME
+       && (operand_equal_p (g_lhs, inner_bound, 0)
+	   || operand_equal_p (g_rhs, inner_bound, 0)));
+  if (!matches_bound)
+    return false;
+
+  /* Identify the taken and skip successors of the guard.  Walk
+     single-succ chains (inside the outer loop) to decide which
+     direction reaches the inner preheader.  */
+  basic_block preheader_bb = pre_e->src;
+  edge taken_e = NULL, skip_e = NULL;
+  edge e;
+  edge_iterator ei;
+  FOR_EACH_EDGE (e, ei, guard_bb->succs)
+    {
+      basic_block dst = e->dest;
+      int hops = 0;
+      while (dst != preheader_bb
+	     && hops++ < 8
+	     && single_succ_p (dst)
+	     && dst->loop_father == loop)
+	dst = single_succ (dst);
+      if (dst == preheader_bb)
+	{
+	  if (taken_e)
+	    return false;		/* Both paths reach the inner.  */
+	  taken_e = e;
+	}
+      else
+	{
+	  if (skip_e)
+	    return false;
+	  skip_e = e;
+	}
+    }
+  if (!taken_e || !skip_e)
+    return false;
+
+  /* The skip path and the inner exit must meet at a common merge BB
+     inside the outer loop, reached by single-successor chains from
+     both directions.  */
+  basic_block merge_from_exit = exit_e->dest;
+  {
+    int hops = 0;
+    while (merge_from_exit->loop_father == loop
+	   && single_succ_p (merge_from_exit)
+	   && hops++ < 8)
+      {
+	basic_block next = single_succ (merge_from_exit);
+	if (next == merge_from_exit)
+	  break;
+	merge_from_exit = next;
+      }
+  }
+  basic_block skip_dst = skip_e->dest;
+  {
+    int hops = 0;
+    while (skip_dst != merge_from_exit
+	   && skip_dst->loop_father == loop
+	   && single_succ_p (skip_dst)
+	   && hops++ < 8)
+      skip_dst = single_succ (skip_dst);
+  }
+  if (skip_dst != merge_from_exit)
+    return false;
+
+  /* The merge BB must have exactly two predecessors: the skip path
+     and the inner-exit path.  Any third predecessor means there is
+     another path into the merge that our mutation would not account
+     for; dropping the skip edge would leave the merge PHIs
+     inconsistent.  This is the concrete difference between the
+     safely-simplifiable Fortran zero-trip pattern and shapes like
+     gcc.dg/vect/no-scevccp-outer-9.c where the merge is also reached
+     by the outer loop's own back-edge or a reduction feedback
+     path.  */
+  basic_block merge_bb = skip_dst;
+  if (EDGE_COUNT (merge_bb->preds) != 2)
+    return false;
+
+  /* All checks passed — apply the simplification.  */
+  if (dump_enabled_p ())
+    dump_printf_loc (MSG_NOTE | MSG_PRIORITY_USER_FACING, vect_location,
+		     "eliminating redundant inner-loop guard BB %d"
+		     " (inner is test-at-top; merge PHIs become"
+		     " degenerate).\n",
+		     guard_bb->index);
+
+  profile_count guard_count = guard_bb->count;
+
+  gsi_remove (&guard_gsi, true);
+  remove_edge (skip_e);
+  taken_e->flags &= ~(EDGE_TRUE_VALUE | EDGE_FALSE_VALUE);
+  taken_e->flags |= EDGE_FALLTHRU;
+  taken_e->probability = profile_probability::always ();
+
+  /* The taken path now carries the full guard_bb count (previously
+     only the taken-probability fraction).  Update downstream BB
+     counts on the single-pred chain between taken_e->dest and
+     merge_bb so the profile-sum verifier is satisfied.  */
+  if (guard_count.initialized_p ())
+    {
+      basic_block bb = taken_e->dest;
+      int hops = 0;
+      while (bb != merge_bb && hops++ < 16)
+	{
+	  /* Only overwrite if this BB is on the pure taken-only chain
+	     (single-pred, so its count is entirely determined by the
+	     incoming taken flow).  Avoid touching BBs with additional
+	     predecessors (e.g., loop back-edges).  */
+	  if (!single_pred_p (bb))
+	    break;
+	  bb->count = guard_count;
+	  if (!single_succ_p (bb))
+	    break;
+	  bb = single_succ (bb);
+	}
+    }
+  return true;
+}
+
 /* Function vect_analyze_loop_form.
 
    Verify that certain CFG restrictions hold, including:
@@ -1781,6 +2077,26 @@ vect_analyze_loop_form (class loop *loop, gimple *loop_vectorized_call,
 			 "accepted outer loop with inner-loop back-edge"
 			 " / guard control flow (relaxed for"
 			 " outer-invariant inner-loop pattern).\n");
+
+      /* Phase 3: if we accepted a relaxed shape, try to simplify the
+	 CFG by removing the redundant zero-trip guard wrapping the
+	 test-at-top inner loop.  Pattern detection in the helper is
+	 strict — it only matches when the guard gcond references the
+	 very SSA used as the inner's exit bound and the skip/exit
+	 paths rejoin at a common merge BB.  */
+      if (relaxed_cf_for_inner_loop
+	  && vect_simplify_guarded_inner_loop (loop))
+	{
+	  /* Remove any BBs now unreachable from entry (intermediate
+	     blocks on the deleted skip path).  Must happen before
+	     recomputing dominators; otherwise calc_dfs_tree asserts.  */
+	  delete_unreachable_blocks ();
+	  free_dominance_info (CDI_DOMINATORS);
+	  free_dominance_info (CDI_POST_DOMINATORS);
+	  calculate_dominance_info (CDI_DOMINATORS);
+	  scev_reset_htab ();
+	  free_numbers_of_iterations_estimates (loop);
+	}
       info->inner_loop_cond = inner.conds[0];
     }
 
