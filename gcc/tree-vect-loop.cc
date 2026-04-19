@@ -1687,35 +1687,36 @@ vect_simplify_guarded_inner_loop (class loop *loop)
 		     guard_bb->index);
 
   profile_count guard_count = guard_bb->count;
+  profile_count old_taken_count = taken_e->count ();
+
+  /* Scale up BB counts of the entire region strictly dominated by
+     taken_e->dest — these BBs used to see only the taken fraction
+     of the guard's flow and, after the mutation, will see the full
+     flow.  Use scale_strictly_dominated_blocks (cfg.cc) so the scale
+     propagates through loop-versioning and peel regions that a
+     simple single-pred walk could not reach.  CDI_DOMINATORS is
+     valid at this point (set up by vect_analyze_loop_form's
+     caller).  merge_bb is not dominated by taken_e->dest (it has a
+     second predecessor via the skip path until we remove it), so
+     it is naturally excluded.  */
+  if (guard_count.initialized_p () && old_taken_count.initialized_p ()
+      && old_taken_count.nonzero_p ()
+      && dom_info_available_p (CDI_DOMINATORS))
+    {
+      /* scale_strictly_dominated_blocks scales only the descendants
+	 of its first argument, not the argument itself; scale
+	 taken_e->dest explicitly.  */
+      taken_e->dest->count
+	= taken_e->dest->count.apply_scale (guard_count, old_taken_count);
+      scale_strictly_dominated_blocks (taken_e->dest, guard_count,
+				       old_taken_count);
+    }
 
   gsi_remove (&guard_gsi, true);
   remove_edge (skip_e);
   taken_e->flags &= ~(EDGE_TRUE_VALUE | EDGE_FALSE_VALUE);
   taken_e->flags |= EDGE_FALLTHRU;
   taken_e->probability = profile_probability::always ();
-
-  /* The taken path now carries the full guard_bb count (previously
-     only the taken-probability fraction).  Update downstream BB
-     counts on the single-pred chain between taken_e->dest and
-     merge_bb so the profile-sum verifier is satisfied.  */
-  if (guard_count.initialized_p ())
-    {
-      basic_block bb = taken_e->dest;
-      int hops = 0;
-      while (bb != merge_bb && hops++ < 16)
-	{
-	  /* Only overwrite if this BB is on the pure taken-only chain
-	     (single-pred, so its count is entirely determined by the
-	     incoming taken flow).  Avoid touching BBs with additional
-	     predecessors (e.g., loop back-edges).  */
-	  if (!single_pred_p (bb))
-	    break;
-	  bb->count = guard_count;
-	  if (!single_succ_p (bb))
-	    break;
-	  bb = single_succ (bb);
-	}
-    }
   return true;
 }
 
