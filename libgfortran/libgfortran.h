@@ -646,6 +646,10 @@ typedef struct
   int all_unbuffered, unbuffered_preconnected;
   int fpe, backtrace;
   int unformatted_buffer_size, formatted_buffer_size;
+  /* Copy the data of asynchronous WRITE statements at the statement
+     (GFORTRAN_ASYNC_COPY) and the per-unit limit in MiB for outstanding
+     copies (GFORTRAN_ASYNC_COPY_LIMIT, 0 = unlimited).  */
+  int async_copy, async_copy_limit;
 }
 options_t;
 

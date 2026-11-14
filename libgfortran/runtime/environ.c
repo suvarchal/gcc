@@ -205,6 +205,13 @@ static variable variable_table[] = {
   { "GFORTRAN_FORMATTED_BUFFER_SIZE", 0, &options.formatted_buffer_size,
     init_integer },
 
+  /* Copy the data of asynchronous WRITE statements when the statement
+     executes instead of reading the variables from the I/O thread.  */
+  { "GFORTRAN_ASYNC_COPY", 0, &options.async_copy, init_boolean },
+
+  /* Limit in MiB for outstanding copied asynchronous output per unit.  */
+  { "GFORTRAN_ASYNC_COPY_LIMIT", 0, &options.async_copy_limit, init_integer },
+
   { NULL, 0, NULL, NULL }
 };
 

@@ -60,12 +60,57 @@ typedef struct transfer_queue
   transfer_args arg;
   _Bool has_id;
   int read_flag;
+  /* Buffer holding a copy of the data (GFORTRAN_ASYNC_COPY), freed by the
+     I/O thread once the item has been processed, and its size.  */
+  void *owned;
+  size_t owned_bytes;
+  size_t owned_cap;
 } transfer_queue;
 
 struct error {
   st_parameter_dt *dtp;
   int id;
 };
+
+/* Released copy-on-enqueue buffers kept for reuse, so that repeated
+   writes do not pay for page faults on freshly allocated memory each
+   time.  The pool is process-wide because programs typically open a new
+   file for every restart dump, which would discard a per-unit pool.  A
+   buffer is only ever allocated when no pooled one fits, so the pool can
+   not grow beyond the peak amount of copies alive at once; in addition
+   GFORTRAN_ASYNC_COPY_LIMIT caps it when set.  */
+
+struct async_spare {
+  void *buf;
+  size_t cap;
+  struct async_spare *next;
+};
+
+static struct async_spare *spare_pool = NULL;
+static size_t spare_pool_bytes = 0;
+static __gthread_mutex_t spare_pool_lock = __GTHREAD_MUTEX_INIT;
+
+/* Hand a released buffer to the pool or free it.  */
+
+static void
+spare_release (void *buf, size_t cap)
+{
+  size_t limit = options.async_copy_limit > 0
+		 ? (size_t) options.async_copy_limit << 20 : 0;
+  LOCK (&spare_pool_lock);
+  if (limit == 0 || spare_pool_bytes + cap <= limit)
+    {
+      struct async_spare *s = xmalloc (sizeof (struct async_spare));
+      s->buf = buf;
+      s->cap = cap;
+      s->next = spare_pool;
+      spare_pool = s;
+      spare_pool_bytes += cap;
+      buf = NULL;
+    }
+  UNLOCK (&spare_pool_lock);
+  free (buf);
+}
 
 /* Helper function to exchange the old vs. a new PDT.  */
 
@@ -188,6 +233,11 @@ async_io (void *arg)
 		free (ctq->arg.array.desc);
 	    }
 
+  	  if (ctq->owned)
+	    {
+	      spare_release (ctq->owned, ctq->owned_cap);
+	      au->copy_bytes_outstanding -= ctq->owned_bytes;
+	    }
   	  NOTE ("Next ctq, current id: %d", au->id.low);
   	  if (ctq->has_id && au->id.waiting == au->id.low++)
 	    SIGNAL (&au->id.done);
@@ -257,6 +307,7 @@ init_async_unit (gfc_unit *u)
   au->pdt = NULL;
   au->head = NULL;
   au->tail = NULL;
+  au->copy_bytes_outstanding = 0;
   au->empty = true;
   au->id.waiting = -1;
   au->id.low = 0;
@@ -271,13 +322,18 @@ init_async_unit (gfc_unit *u)
 /* Enqueue a transfer statement.  */
 
 void
-enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type)
+enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type,
+		  void *owned, size_t owned_bytes, size_t owned_cap)
 {
   transfer_queue *tq = calloc (1, sizeof (transfer_queue));
   tq->arg = *arg;
   tq->type = type;
   tq->has_id = 0;
+  tq->owned = owned;
+  tq->owned_bytes = owned_bytes;
+  tq->owned_cap = owned_cap;
   LOCK (&au->lock);
+  au->copy_bytes_outstanding += owned_bytes;
   if (!au->tail)
     au->head = tq;
   else
@@ -372,6 +428,8 @@ enqueue_data_transfer_init (async_unit *au, st_parameter_dt *dt, int read_flag)
   tq->read_flag = read_flag;
   tq->has_id = 0;
   tq->new_pdt = new;
+  tq->owned = NULL;
+  tq->owned_bytes = 0;
   LOCK (&au->lock);
 
   if (!au->tail)
@@ -453,6 +511,36 @@ async_wait_id (st_parameter_common *cmp, async_unit *au, int i)
   return ret;
 }
 
+/* Return a buffer of at least NBYTES for a copy-on-enqueue transfer,
+   reusing the unit's spare buffer when it is large enough.  The capacity
+   of the returned buffer is stored in *CAP.  */
+
+void *
+async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
+{
+  void *buf = NULL;
+  struct async_spare **best = NULL, **pp;
+  LOCK (&spare_pool_lock);
+  /* Best fit: the smallest pooled buffer that is large enough.  */
+  for (pp = &spare_pool; *pp; pp = &(*pp)->next)
+    if ((*pp)->cap >= nbytes && (best == NULL || (*pp)->cap < (*best)->cap))
+      best = pp;
+  if (best)
+    {
+      struct async_spare *s = *best;
+      *best = s->next;
+      buf = s->buf;
+      *cap = s->cap;
+      spare_pool_bytes -= s->cap;
+      free (s);
+    }
+  UNLOCK (&spare_pool_lock);
+  if (buf)
+    return buf;
+  *cap = nbytes;
+  return xmalloc (nbytes);
+}
+
 /* Assign an ID to a statement on an asynchronous unit that was
    completed synchronously.  */
 
@@ -523,9 +611,18 @@ init_async_unit (gfc_unit *u)
 /* Do-nothing function, which will not be called.  */
 
 void
-enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type)
+enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type,
+		  void *owned, size_t owned_bytes, size_t owned_cap)
 {
   return;
+}
+
+/* Do-nothing function, which will not be called.  */
+void *
+async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
+{
+  *cap = 0;
+  return NULL;
 }
 
 /* Do-nothing function, which will not be called.  */

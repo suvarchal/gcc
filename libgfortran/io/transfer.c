@@ -2674,6 +2674,89 @@ formatted_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
     }
 }
 
+/* Copy-on-enqueue support for asynchronous output (GFORTRAN_ASYNC_COPY).
+   Return a buffer of NBYTES that the queue takes ownership of, or NULL if
+   the data is to be read from the user's variable by the I/O thread as
+   usual.  When the per-unit limit on outstanding copies would be
+   exceeded, wait for the pending operations of the unit first.  */
+
+static void *
+async_copy_alloc (st_parameter_dt *dtp, size_t nbytes, size_t *cap)
+{
+  async_unit *au = dtp->u.p.current_unit->au;
+
+  *cap = 0;
+
+  if (!options.async_copy || dtp->u.p.mode != WRITING || nbytes == 0)
+    return NULL;
+
+  if (options.async_copy_limit > 0)
+    {
+      size_t limit = (size_t) options.async_copy_limit << 20;
+      bool over;
+      LOCK (&au->lock);
+      over = au->copy_bytes_outstanding > 0
+	     && au->copy_bytes_outstanding + nbytes > limit;
+      UNLOCK (&au->lock);
+      if (over)
+	async_wait (&dtp->common, au);
+    }
+
+  return async_copy_buffer (au, nbytes, cap);
+}
+
+/* Pack the elements of the (possibly non-contiguous) array described by
+   DESC into DEST, in array element order.  Same traversal as
+   transfer_array_inner.  */
+
+static void
+async_pack_array (gfc_array_char *desc, size_t elem_bytes, char *dest)
+{
+  index_type count[GFC_MAX_DIMENSIONS];
+  index_type extent[GFC_MAX_DIMENSIONS];
+  index_type stride[GFC_MAX_DIMENSIONS];
+  index_type rank, n, chunk, span;
+  char *data;
+
+  rank = GFC_DESCRIPTOR_RANK (desc);
+  span = desc->span > 0 ? desc->span : (index_type) elem_bytes;
+  for (n = 0; n < rank; n++)
+    {
+      count[n] = 0;
+      stride[n] = GFC_DESCRIPTOR_STRIDE (desc, n) * span;
+      extent[n] = GFC_DESCRIPTOR_EXTENT (desc, n);
+      if (extent[n] <= 0)
+	return;
+    }
+
+  chunk = stride[0] == (index_type) elem_bytes ? extent[0] : 1;
+  data = GFC_DESCRIPTOR_DATA (desc);
+  while (data)
+    {
+      memcpy (dest, data, chunk * elem_bytes);
+      dest += chunk * elem_bytes;
+      data += stride[0] * chunk;
+      count[0] += chunk;
+      n = 0;
+      while (count[n] == extent[n])
+	{
+	  count[n] = 0;
+	  data -= stride[n] * extent[n];
+	  n++;
+	  if (n == rank)
+	    {
+	      data = NULL;
+	      break;
+	    }
+	  else
+	    {
+	      count[n]++;
+	      data += stride[n];
+	    }
+	}
+    }
+}
+
 /* Wrapper function for I/O of scalar types.  If this should be an async I/O
    request, queue it.  For a synchronous write on an async unit, perform the
    wait operation and return an error.  For all synchronous writes, call the
@@ -2688,6 +2771,19 @@ wrap_scalar_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
       if (dtp->u.p.async)
 	{
 	  transfer_args args;
+	  void *owned = NULL;
+	  size_t nbytes = 0, cap = 0;
+	  if (type != BT_CLASS)
+	    {
+	      nbytes = (type == BT_CHARACTER
+			? size * GFC_SIZE_OF_CHAR_KIND (kind) : size) * n_elem;
+	      owned = async_copy_alloc (dtp, nbytes, &cap);
+	      if (owned)
+		{
+		  memcpy (owned, p, nbytes);
+		  p = owned;
+		}
+	    }
 	  args.scalar.transfer = dtp->u.p.transfer;
 	  args.scalar.arg_bt = type;
 	  args.scalar.data = p;
@@ -2695,7 +2791,7 @@ wrap_scalar_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
 	  args.scalar.s1 = size;
 	  args.scalar.s2 = n_elem;
 	  enqueue_transfer (dtp->u.p.current_unit->au, &args,
-			    AIO_TRANSFER_SCALAR);
+			    AIO_TRANSFER_SCALAR, owned, nbytes, cap);
 	  return;
 	}
     }
@@ -2960,8 +3056,42 @@ transfer_array (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
 	  memcpy (args.array.desc, desc, sz);
 	  args.array.kind = kind;
 	  args.array.charlen = charlen;
-	  enqueue_transfer (dtp->u.p.current_unit->au, &args,
-			    AIO_TRANSFER_ARRAY);
+
+	  /* Copy-on-enqueue: pack the data into a buffer owned by the
+	     queue and point the copied descriptor at it, contiguously.  */
+	  {
+	    void *owned = NULL;
+	    size_t nbytes = 0, cap = 0;
+	    size_t elem_bytes = GFC_DESCRIPTOR_SIZE (desc);
+	    index_type rank = GFC_DESCRIPTOR_RANK (desc);
+	    index_type n, nelem = 1;
+	    for (n = 0; n < rank; n++)
+	      {
+		index_type e = GFC_DESCRIPTOR_EXTENT (desc, n);
+		nelem *= e > 0 ? e : 0;
+	      }
+	    nbytes = (size_t) nelem * elem_bytes;
+	    owned = async_copy_alloc (dtp, nbytes, &cap);
+	    if (owned)
+	      {
+		gfc_array_char *d = args.array.desc;
+		index_type str = 1;
+		async_pack_array (desc, elem_bytes, owned);
+		GFC_DESCRIPTOR_DATA (d) = owned;
+		d->offset = 0;
+		d->span = elem_bytes;
+		for (n = 0; n < rank; n++)
+		  {
+		    index_type lb = GFC_DESCRIPTOR_LBOUND (desc, n);
+		    index_type e = GFC_DESCRIPTOR_EXTENT (desc, n);
+		    GFC_DIMENSION_SET (d->dim[n], lb, lb + e - 1, str);
+		    d->offset -= lb * str;
+		    str *= e;
+		  }
+	      }
+	    enqueue_transfer (dtp->u.p.current_unit->au, &args,
+			      AIO_TRANSFER_ARRAY, owned, nbytes, cap);
+	  }
 	  return;
 	}
     }

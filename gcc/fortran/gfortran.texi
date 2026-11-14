@@ -585,6 +585,8 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_ERROR_BACKTRACE:: Show backtrace on run-time errors
 * GFORTRAN_FORMATTED_BUFFER_SIZE:: Buffer size for formatted files
 * GFORTRAN_UNFORMATTED_BUFFER_SIZE:: Buffer size for unformatted files
+* GFORTRAN_ASYNC_COPY:: Copy data of asynchronous WRITE statements
+* GFORTRAN_ASYNC_COPY_LIMIT:: Limit for outstanding asynchronous copies
 @end menu
 
 @node TMPDIR
@@ -781,6 +783,32 @@ The default value is 8192.
 The @env{GFORTRAN_UNFORMATTED_BUFFER_SIZE} environment variable
 specifies buffer size in bytes to be used for unformatted output.
 The default value is 131072.
+
+@node GFORTRAN_ASYNC_COPY
+@section @env{GFORTRAN_ASYNC_COPY}---Copy data of asynchronous WRITE statements
+
+If the first letter is @samp{y}, @samp{Y} or @samp{1}, the data of every
+asynchronous @code{WRITE} statement (a statement with
+@code{ASYNCHRONOUS='YES'} on a unit opened with @code{ASYNCHRONOUS='YES'})
+is copied into a buffer owned by the runtime library when the statement
+executes, and the buffer is written to the file by the I/O thread.  The
+program may therefore modify the variables of the output list as soon as
+the statement has completed, without waiting for the pending operation.
+This is an extension; a standard-conforming program does not modify such
+variables before the matching @code{WAIT} and behaves identically with or
+without this variable.  The copy costs memory, up to the size of all
+outstanding output, and the time of one memory copy on the calling thread.
+Asynchronous @code{READ} statements are not affected.  The default is not
+to copy.
+
+@node GFORTRAN_ASYNC_COPY_LIMIT
+@section @env{GFORTRAN_ASYNC_COPY_LIMIT}---Limit for outstanding asynchronous copies
+
+With @env{GFORTRAN_ASYNC_COPY} set, this variable gives the maximum amount
+of copied output, in mebibytes, that may be outstanding per unit.  When a
+new asynchronous @code{WRITE} would exceed the limit, the statement first
+waits for the pending operations of its unit to complete.  A value of 0,
+the default, means no limit.
 
 @c =====================================================================
 @c PART II: LANGUAGE REFERENCE

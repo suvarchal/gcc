@@ -617,6 +617,8 @@ typedef struct async_unit
   __gthread_t thread;
   struct transfer_queue *head;
   struct transfer_queue *tail;
+  /* Bytes of copied output (GFORTRAN_ASYNC_COPY) still in the queue.  */
+  size_t copy_bytes_outstanding;
 
   struct {
     const char *message;
@@ -638,6 +640,9 @@ internal_proto (async_wait);
 bool async_wait_id (st_parameter_common *, async_unit *, int);
 internal_proto (async_wait_id);
 
+void *async_copy_buffer (async_unit *, size_t, size_t *);
+internal_proto (async_copy_buffer);
+
 int async_complete_id (async_unit *);
 internal_proto (async_complete_id);
 
@@ -647,7 +652,8 @@ internal_proto (collect_async_errors);
 void async_close (async_unit *);
 internal_proto (async_close);
 
-void enqueue_transfer (async_unit * au, transfer_args * arg, enum aio_do);
+void enqueue_transfer (async_unit * au, transfer_args * arg, enum aio_do,
+		       void *owned, size_t owned_bytes, size_t owned_cap);
 internal_proto (enqueue_transfer);
 
 void enqueue_done (async_unit *, enum aio_do type);
