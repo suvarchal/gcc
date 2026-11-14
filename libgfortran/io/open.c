@@ -705,22 +705,37 @@ new_unit (st_parameter_open *opp, gfc_unit *u, unit_flags *flags)
 	  if (sseek (u->s, 0, SEEK_SET) >= 0
 	      && sread (u->s, hdr, n + GFC_BLOSC_MAGIC_LEN)
 		 == (ssize_t) (n + GFC_BLOSC_MAGIC_LEN)
-	      && memcmp (hdr + n, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0)
+	      && (memcmp (hdr + n, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0
+		  || memcmp (hdr + n, GFC_BLOSC2_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0))
 	    {
-#ifdef HAVE_BLOSC
-	      u->compress = 1;
-#else
-	      generate_error (&opp->common, LIBERROR_OS,
-			      "File is blosc-compressed but this libgfortran "
-			      "was built without blosc support");
-#endif
+	      if (gfc_blosc2_available ())
+		u->compress = 1;
+	      else
+		{
+		  char msg[512];
+		  snprintf (msg, sizeof msg, "File is blosc-compressed but "
+			    "c-blosc2 could not be loaded: %s",
+			    gfc_blosc2_error ());
+		  /* LIBERROR_OS reports errno as IOSTAT: make it nonzero.  */
+		  errno = ENOSYS;
+		  generate_error (&opp->common, LIBERROR_OS, msg);
+		}
 	    }
 	  sseek (u->s, save, SEEK_SET);
 	}
-#ifdef HAVE_BLOSC
       else if (options.compress_codec != NULL)
-	u->compress = 1;
-#endif
+	{
+	  static int warned = 0;
+	  if (gfc_blosc2_available ())
+	    u->compress = 1;
+	  else if (!warned)
+	    {
+	      warned = 1;
+	      fprintf (stderr, "libgfortran: GFORTRAN_COMPRESS is set but "
+		       "c-blosc2 could not be loaded (%s); writing "
+		       "uncompressed files\n", gfc_blosc2_error ());
+	    }
+	}
     }
 
   return u;

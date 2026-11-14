@@ -469,7 +469,16 @@ st_parameter_inquire;
 /* Header record identifying a blosc-compressed unformatted sequential
    file: a record of GFC_BLOSC_MAGIC_LEN bytes at the start of the file.  */
 #define GFC_BLOSC_MAGIC "GFORTRAN_BLOSC1"
+#define GFC_BLOSC2_MAGIC "GFORTRAN_BLOSC2"
 #define GFC_BLOSC_MAGIC_LEN 16
+
+/* c-blosc2, loaded at run time.  */
+extern bool gfc_blosc2_available (void);
+internal_proto (gfc_blosc2_available);
+extern const char *gfc_blosc2_error (void);
+internal_proto (gfc_blosc2_error);
+extern void gfc_blosc2_unit_free (struct gfc_unit *);
+internal_proto (gfc_blosc2_unit_free);
 #define IOPARM_DT_DEC_EXT			(1 << 27)
 /* Internal use bit.  */
 #define IOPARM_DT_IONML_SET			(1u << 31)
@@ -722,6 +731,12 @@ typedef struct gfc_unit
   size_t zbuf_cap;
   char *dbuf;
   size_t dbuf_cap, dbuf_len, dbuf_pos;
+  /* c-blosc2 contexts (GFORTRAN_COMPRESS): compression contexts cached by
+     element size, so blosc's worker threads are not recreated per chunk,
+     and one decompression context.  */
+  void *zcctx[6];
+  int zcctx_typesize[6];
+  void *zdctx;
 
   __gthread_mutex_t lock;
   /* Number of threads waiting to acquire this unit's lock.

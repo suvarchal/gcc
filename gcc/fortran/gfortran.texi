@@ -827,7 +827,8 @@ duration of the copy.  The default is 1.
 @node GFORTRAN_COMPRESS
 @section @env{GFORTRAN_COMPRESS}---Compress unformatted sequential files
 
-If GNU Fortran was built with blosc support, setting this variable to
+If GNU Fortran was built with c-blosc2 support and the c-blosc2 shared
+library can be loaded at run time, setting this variable to
 @code{@var{codec}[:@var{level}[:@var{shuffle}[:@var{threads}]]]} makes
 every unformatted sequential file that is created or empty when opened a
 compressed file.  @var{codec} is one of @code{blosclz}, @code{lz4},
@@ -856,10 +857,19 @@ markers hold the compressed lengths, so @code{BACKSPACE} and record
 skipping work as usual.  Existing non-empty files decide for themselves:
 a compressed file is read as such whether or not the variable is set,
 and an uncompressed file is read uncompressed.  Files written with this
-variable set cannot be read by programs linked against a GNU Fortran
-runtime without blosc support, which report an error when opening them.
+variable set cannot be read by a GNU Fortran
+runtime that cannot load c-blosc2, which reports an error when opening them.
 Direct access, stream access and formatted files are not affected.
 The default is no compression.
+
+The runtime library does not link against c-blosc2.  It loads the shared
+library @file{libblosc2.so} with @code{dlopen} the first time a unit needs
+it, or the file named by @env{GFORTRAN_BLOSC2_LIB}, and accepts it only if
+its major version matches the one GNU Fortran was built with.  If no
+suitable library is found, a program that sets @env{GFORTRAN_COMPRESS}
+writes uncompressed files after a single warning, and opening a compressed
+file fails with a nonzero @code{IOSTAT} and a message naming the reason.
+Files written by earlier versions with c-blosc 1 remain readable.
 
 @node GFORTRAN_ASYNC_IO_CPUS
 @section @env{GFORTRAN_ASYNC_IO_CPUS}---CPUs for the asynchronous I/O threads

@@ -914,6 +914,7 @@ close_unit_1 (gfc_unit *u, int locked, bool free_newunit)
   delete_unit (u);
 
   free (u->filename);
+  gfc_blosc2_unit_free (u);
   free (u->cbuf);
   free (u->zbuf);
   free (u->dbuf);

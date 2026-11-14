@@ -32,8 +32,11 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 #include "format.h"
 #include "unix.h"
 #include "async.h"
-#ifdef HAVE_BLOSC
-#include <blosc.h>
+#ifdef HAVE_BLOSC2
+/* Only the types and constants come from the header; the library itself
+   is loaded at run time with dlopen, see gfc_blosc2_available.  */
+#include <blosc2.h>
+#include <dlfcn.h>
 #endif
 #include <string.h>
 #include <errno.h>
@@ -155,7 +158,7 @@ static void next_record_r_unf (st_parameter_dt *, int);
 static void next_record_w_unf (st_parameter_dt *, int);
 static bool write_buf_seq (st_parameter_dt *, void *, size_t);
 static void read_block_direct_seq (st_parameter_dt *, void *, size_t);
-#ifdef HAVE_BLOSC
+#ifdef HAVE_BLOSC2
 static bool write_buf_compressed (st_parameter_dt *, void *, size_t);
 static bool flush_compressed (st_parameter_dt *);
 static void read_block_direct_compressed (st_parameter_dt *, void *, size_t);
@@ -731,7 +734,7 @@ read_block_direct (st_parameter_dt *dtp, void *buf, size_t nbytes)
 
   /* Unformatted sequential.  */
 
-#ifdef HAVE_BLOSC
+#ifdef HAVE_BLOSC2
   if (dtp->u.p.current_unit->compress)
     {
       read_block_direct_compressed (dtp, buf, nbytes);
@@ -919,7 +922,170 @@ write_block (st_parameter_dt *dtp, size_t length)
 }
 
 
-#ifdef HAVE_BLOSC
+#ifdef HAVE_BLOSC2
+
+/* c-blosc2 loaded at run time.
+
+   libgfortran is built against the c-blosc2 headers only.  The library is
+   opened with dlopen the first time a unit needs it, and the few entry
+   points used are kept as function pointers, the way libgomp loads its
+   offloading plugins.  The compression code that runs is the library's
+   own; the indirect call costs nanoseconds against milliseconds per chunk.
+   GFORTRAN_BLOSC2_LIB names the library file explicitly.  */
+
+static struct
+{
+  int state;			/* 0 not tried, 1 loaded, -1 failed.  */
+  char err[256];
+  void (*init) (void);
+  blosc2_context *(*create_cctx) (blosc2_cparams);
+  blosc2_context *(*create_dctx) (blosc2_dparams);
+  void (*free_ctx) (blosc2_context *);
+  int (*compress_ctx) (blosc2_context *, const void *, int32_t, void *,
+		       int32_t);
+  int (*decompress_ctx) (blosc2_context *, const void *, int32_t, void *,
+			 int32_t);
+  const char *(*version) (void);
+} b2;
+
+static __gthread_mutex_t b2_lock = __GTHREAD_MUTEX_INIT;
+
+static void
+b2_load (void)
+{
+  static const char *const names[] =
+    { "libblosc2.so", "libblosc2.so.10", "libblosc2.so.4", "libblosc2.so.2",
+      NULL };
+  const char *env = getenv ("GFORTRAN_BLOSC2_LIB");
+  void *h = NULL;
+  int i;
+
+  if (env && *env)
+    h = dlopen (env, RTLD_NOW | RTLD_LOCAL);
+  for (i = 0; !h && names[i] && !(env && *env); i++)
+    h = dlopen (names[i], RTLD_NOW | RTLD_LOCAL);
+  if (!h)
+    {
+      const char *e = dlerror ();
+      snprintf (b2.err, sizeof b2.err, "%s", e ? e : "libblosc2 not found");
+      b2.state = -1;
+      return;
+    }
+#define B2SYM(field, name) \
+  if (!(*(void **) &b2.field = dlsym (h, name))) \
+    { snprintf (b2.err, sizeof b2.err, "symbol %s missing", name); \
+      b2.state = -1; dlclose (h); return; }
+  B2SYM (init, "blosc2_init");
+  B2SYM (create_cctx, "blosc2_create_cctx");
+  B2SYM (create_dctx, "blosc2_create_dctx");
+  B2SYM (free_ctx, "blosc2_free_ctx");
+  B2SYM (compress_ctx, "blosc2_compress_ctx");
+  B2SYM (decompress_ctx, "blosc2_decompress_ctx");
+  B2SYM (version, "blosc2_get_version_string");
+#undef B2SYM
+  /* The parameter structs are passed by value, so their layout must match
+     the headers libgfortran was built with: require the same major
+     version.  */
+  if (atoi (b2.version ()) != BLOSC2_VERSION_MAJOR)
+    {
+      snprintf (b2.err, sizeof b2.err, "c-blosc2 %s found, major version "
+		"%d required", b2.version (), BLOSC2_VERSION_MAJOR);
+      b2.state = -1;
+      dlclose (h);
+      return;
+    }
+  b2.init ();
+  b2.state = 1;
+}
+
+bool
+gfc_blosc2_available (void)
+{
+  if (__atomic_load_n (&b2.state, __ATOMIC_ACQUIRE) == 0)
+    {
+      __gthread_mutex_lock (&b2_lock);
+      if (b2.state == 0)
+	b2_load ();
+      __gthread_mutex_unlock (&b2_lock);
+    }
+  return b2.state == 1;
+}
+
+const char *
+gfc_blosc2_error (void)
+{
+  return b2.err[0] ? b2.err : "not built with c-blosc2 support";
+}
+
+void
+gfc_blosc2_unit_free (gfc_unit *u)
+{
+  int i;
+  for (i = 0; i < 6; i++)
+    if (u->zcctx[i])
+      {
+	b2.free_ctx (u->zcctx[i]);
+	u->zcctx[i] = NULL;
+      }
+  if (u->zdctx)
+    {
+      b2.free_ctx (u->zdctx);
+      u->zdctx = NULL;
+    }
+}
+
+static int
+b2_compcode (const char *name)
+{
+  if (strcmp (name, "blosclz") == 0) return BLOSC_BLOSCLZ;
+  if (strcmp (name, "lz4") == 0) return BLOSC_LZ4;
+  if (strcmp (name, "lz4hc") == 0) return BLOSC_LZ4HC;
+  if (strcmp (name, "zlib") == 0) return BLOSC_ZLIB;
+  return BLOSC_ZSTD;
+}
+
+/* Compression context of unit U for element size TYPESIZE.  */
+
+static blosc2_context *
+b2_cctx (gfc_unit *u, int typesize)
+{
+  int slot = typesize == 1 ? 0 : typesize == 2 ? 1 : typesize == 4 ? 2
+	     : typesize == 8 ? 3 : typesize == 16 ? 4 : 5;
+  if (u->zcctx[slot] && u->zcctx_typesize[slot] != typesize)
+    {
+      b2.free_ctx (u->zcctx[slot]);
+      u->zcctx[slot] = NULL;
+    }
+  if (!u->zcctx[slot])
+    {
+      blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;
+      int k;
+      cp.compcode = b2_compcode (options.compress_codec);
+      cp.clevel = options.compress_level;
+      cp.typesize = typesize;
+      cp.nthreads = options.compress_threads;
+      for (k = 0; k < BLOSC2_MAX_FILTERS; k++)
+	cp.filters[k] = BLOSC_NOFILTER;
+      cp.filters[BLOSC2_MAX_FILTERS - 1]
+	= options.compress_shuffle == 2 ? BLOSC_BITSHUFFLE
+	  : options.compress_shuffle == 1 ? BLOSC_SHUFFLE : BLOSC_NOFILTER;
+      u->zcctx[slot] = b2.create_cctx (cp);
+      u->zcctx_typesize[slot] = typesize;
+    }
+  return u->zcctx[slot];
+}
+
+static blosc2_context *
+b2_dctx (gfc_unit *u)
+{
+  if (!u->zdctx)
+    {
+      blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
+      dp.nthreads = options.compress_threads;
+      u->zdctx = b2.create_dctx (dp);
+    }
+  return u->zdctx;
+}
 
 /* Largest piece handed to blosc in one call; blosc itself allows a bit
    under 2 GiB.  Every piece becomes one self-describing chunk.  */
@@ -955,8 +1121,9 @@ write_chunk_compressed (st_parameter_dt *dtp, const void *buf, size_t piece,
 			int typesize)
 {
   gfc_unit *u = dtp->u.p.current_unit;
-  size_t need = piece + BLOSC_MAX_OVERHEAD;
+  size_t need = piece + BLOSC2_MAX_OVERHEAD;
   int cbytes;
+  blosc2_context *cc;
 
   if (typesize < 1 || typesize > 255)
     typesize = 1;
@@ -965,12 +1132,12 @@ write_chunk_compressed (st_parameter_dt *dtp, const void *buf, size_t piece,
       generate_error (&dtp->common, LIBERROR_OS, NULL);
       return false;
     }
-  cbytes = blosc_compress_ctx (options.compress_level,
-			       options.compress_shuffle, typesize, piece,
-			       buf, u->zbuf, need, options.compress_codec,
-			       0, options.compress_threads);
+  cc = b2_cctx (u, typesize);
+  cbytes = cc ? b2.compress_ctx (cc, buf, (int32_t) piece, u->zbuf,
+				 (int32_t) need) : -1;
   if (cbytes <= 0)
     {
+      errno = EIO;
       generate_error (&dtp->common, LIBERROR_OS, "Blosc compression failed");
       return false;
     }
@@ -1073,14 +1240,21 @@ read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
 
       /* Refill: one chunk.  */
       {
-	char hdr[BLOSC_MIN_HEADER_LENGTH];
-	size_t nb, cb, bs;
+	unsigned char hdr[BLOSC_MIN_HEADER_LENGTH];
+	size_t nb, cb;
 	int r;
+	blosc2_context *dc;
 
 	read_block_direct_seq (dtp, hdr, sizeof (hdr));
 	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
 	  return;
-	blosc_cbuffer_sizes (hdr, &nb, &cb, &bs);
+	/* The first 16 bytes of a chunk have the same layout in c-blosc 1
+	   and c-blosc2: uncompressed size at offset 4, compressed size at
+	   offset 12, little endian.  Decoding them here means only the
+	   chunk's own bytes are ever read.  */
+	nb = hdr[4] | (hdr[5] << 8) | (hdr[6] << 16) | ((size_t) hdr[7] << 24);
+	cb = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16)
+	     | ((size_t) hdr[15] << 24);
 	if (cb < sizeof (hdr) || nb > GFC_BLOSC_PIECE)
 	  {
 	    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
@@ -1097,7 +1271,9 @@ read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
 	read_block_direct_seq (dtp, u->zbuf + sizeof (hdr), cb - sizeof (hdr));
 	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
 	  return;
-	r = blosc_decompress_ctx (u->zbuf, u->dbuf, nb, options.compress_threads);
+	dc = b2_dctx (u);
+	r = dc ? b2.decompress_ctx (dc, u->zbuf, (int32_t) cb, u->dbuf,
+				    (int32_t) nb) : -1;
 	if (r < 0 || (size_t) r != nb)
 	  {
 	    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
@@ -1110,7 +1286,26 @@ read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
     }
 }
 
-#endif /* HAVE_BLOSC */
+#else /* !HAVE_BLOSC2 */
+
+bool
+gfc_blosc2_available (void)
+{
+  return false;
+}
+
+const char *
+gfc_blosc2_error (void)
+{
+  return "libgfortran was built without c-blosc2 support";
+}
+
+void
+gfc_blosc2_unit_free (gfc_unit *u __attribute__ ((unused)))
+{
+}
+
+#endif /* HAVE_BLOSC2 */
 
 
 /* High level interface to swrite(), taking care of errors.  This is only
@@ -1169,7 +1364,7 @@ write_buf (st_parameter_dt *dtp, void *buf, size_t nbytes)
 
   /* Unformatted sequential.  */
 
-#ifdef HAVE_BLOSC
+#ifdef HAVE_BLOSC2
   if (dtp->u.p.current_unit->compress)
     return write_buf_compressed (dtp, buf, nbytes);
 #endif
@@ -3543,7 +3738,8 @@ us_read (st_parameter_dt *dtp, int continued)
       char magic[GFC_BLOSC_MAGIC_LEN];
       if (sread (dtp->u.p.current_unit->s, magic, GFC_BLOSC_MAGIC_LEN)
 	  == GFC_BLOSC_MAGIC_LEN
-	  && memcmp (magic, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0)
+	  && (memcmp (magic, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0
+	      || memcmp (magic, GFC_BLOSC2_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0))
 	{
 	  if (sseek (dtp->u.p.current_unit->s, n, SEEK_CUR) < 0)
 	    {
@@ -3600,7 +3796,7 @@ us_write (st_parameter_dt *dtp, int continued)
       && stell (dtp->u.p.current_unit->s) == 0)
     {
       if (swrite (dtp->u.p.current_unit->s, &dummy, nbytes) != nbytes
-	  || swrite (dtp->u.p.current_unit->s, GFC_BLOSC_MAGIC,
+	  || swrite (dtp->u.p.current_unit->s, GFC_BLOSC2_MAGIC,
 		     GFC_BLOSC_MAGIC_LEN) != GFC_BLOSC_MAGIC_LEN)
 	{
 	  generate_error (&dtp->common, LIBERROR_OS, NULL);
@@ -4767,7 +4963,7 @@ next_record_w (st_parameter_dt *dtp, int done)
       break;
 
     case UNFORMATTED_SEQUENTIAL:
-#ifdef HAVE_BLOSC
+#ifdef HAVE_BLOSC2
       if (dtp->u.p.current_unit->compress && !flush_compressed (dtp))
 	return;
 #endif
