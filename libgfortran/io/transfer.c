@@ -157,6 +157,7 @@ static bool write_buf_seq (st_parameter_dt *, void *, size_t);
 static void read_block_direct_seq (st_parameter_dt *, void *, size_t);
 #ifdef HAVE_BLOSC
 static bool write_buf_compressed (st_parameter_dt *, void *, size_t);
+static bool flush_compressed (st_parameter_dt *);
 static void read_block_direct_compressed (st_parameter_dt *, void *, size_t);
 #endif
 
@@ -940,48 +941,110 @@ grow_buffer (char **buf, size_t *cap, size_t need)
   return true;
 }
 
-/* Compress NBYTES from BUF chunk by chunk and write the chunks into the
-   current unformatted sequential record.  The record markers count
+/* Size of the staging buffer: data is compressed in chunks of at most
+   this size.  */
+#define GFC_BLOSC_CHUNK ((size_t) 8 << 20)
+
+/* Compress PIECE bytes from BUF with element size TYPESIZE and write
+   the chunk into the current record.  The record markers count
    compressed bytes; each chunk carries its own blosc header with the
    uncompressed size, so the reader needs no further information.  */
+
+static bool
+write_chunk_compressed (st_parameter_dt *dtp, const void *buf, size_t piece,
+			int typesize)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  size_t need = piece + BLOSC_MAX_OVERHEAD;
+  int cbytes;
+
+  if (typesize < 1 || typesize > 255)
+    typesize = 1;
+  if (!grow_buffer (&u->zbuf, &u->zbuf_cap, need))
+    {
+      generate_error (&dtp->common, LIBERROR_OS, NULL);
+      return false;
+    }
+  cbytes = blosc_compress_ctx (options.compress_level,
+			       options.compress_shuffle, typesize, piece,
+			       buf, u->zbuf, need, options.compress_codec,
+			       0, 1);
+  if (cbytes <= 0)
+    {
+      generate_error (&dtp->common, LIBERROR_OS, "Blosc compression failed");
+      return false;
+    }
+  return write_buf_seq (dtp, u->zbuf, cbytes);
+}
+
+/* Compress and write whatever is staged.  Called when the staging
+   buffer is full, when the element size changes and at the end of the
+   record.  */
+
+static bool
+flush_compressed (st_parameter_dt *dtp)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  size_t len = u->cbuf_len;
+
+  u->cbuf_len = 0;
+  if (len == 0)
+    return true;
+  return write_chunk_compressed (dtp, u->cbuf, len, u->cbuf_typesize);
+}
+
+/* Stage NBYTES from BUF for compression.  Items usually arrive in many
+   small pieces (transfer_array_inner delivers one contiguous column at a
+   time), which would compress badly on their own, so collect them and
+   compress GFC_BLOSC_CHUNK bytes at once.  Large pieces bypass the
+   staging buffer.  */
 
 static bool
 write_buf_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
 {
   gfc_unit *u = dtp->u.p.current_unit;
-  size_t off = 0;
   int typesize = u->compress_typesize;
 
-  if (typesize < 1 || typesize > 255)
-    typesize = 1;
+  if (nbytes == 0)
+    return true;
 
-  while (off < nbytes)
+  if (u->cbuf_len > 0 && u->cbuf_typesize != typesize)
+    if (!flush_compressed (dtp))
+      return false;
+
+  if (u->cbuf_len == 0 && nbytes >= GFC_BLOSC_CHUNK)
     {
-      size_t piece = nbytes - off;
-      size_t need;
-      int cbytes;
+      size_t off = 0;
+      while (off < nbytes)
+	{
+	  size_t piece = nbytes - off;
+	  if (piece > GFC_BLOSC_CHUNK)
+	    piece = GFC_BLOSC_CHUNK;
+	  if (!write_chunk_compressed (dtp, (char *) buf + off, piece,
+				       typesize))
+	    return false;
+	  off += piece;
+	}
+      return true;
+    }
 
-      if (piece > GFC_BLOSC_PIECE)
-	piece = GFC_BLOSC_PIECE;
-      need = piece + BLOSC_MAX_OVERHEAD;
-      if (!grow_buffer (&u->zbuf, &u->zbuf_cap, need))
-	{
-	  generate_error (&dtp->common, LIBERROR_OS, NULL);
-	  return false;
-	}
-      cbytes = blosc_compress_ctx (options.compress_level,
-				   options.compress_shuffle, typesize,
-				   piece, (char *) buf + off, u->zbuf, need,
-				   options.compress_codec, 0, 1);
-      if (cbytes <= 0)
-	{
-	  generate_error (&dtp->common, LIBERROR_OS,
-			  "Blosc compression failed");
-	  return false;
-	}
-      if (!write_buf_seq (dtp, u->zbuf, cbytes))
+  if (u->cbuf == NULL && !grow_buffer (&u->cbuf, &u->cbuf_cap,
+				       GFC_BLOSC_CHUNK))
+    {
+      generate_error (&dtp->common, LIBERROR_OS, NULL);
+      return false;
+    }
+  u->cbuf_typesize = typesize;
+  while (nbytes > 0)
+    {
+      size_t room = u->cbuf_cap - u->cbuf_len;
+      size_t take = nbytes < room ? nbytes : room;
+      memcpy (u->cbuf + u->cbuf_len, buf, take);
+      u->cbuf_len += take;
+      buf = (char *) buf + take;
+      nbytes -= take;
+      if (u->cbuf_len == u->cbuf_cap && !flush_compressed (dtp))
 	return false;
-      off += piece;
     }
   return true;
 }
@@ -4704,6 +4767,10 @@ next_record_w (st_parameter_dt *dtp, int done)
       break;
 
     case UNFORMATTED_SEQUENTIAL:
+#ifdef HAVE_BLOSC
+      if (dtp->u.p.current_unit->compress && !flush_compressed (dtp))
+	return;
+#endif
       next_record_w_unf (dtp, 0);
       dtp->u.p.current_unit->bytes_left = dtp->u.p.current_unit->recl;
       break;

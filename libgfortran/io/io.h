@@ -711,6 +711,13 @@ typedef struct gfc_unit
      of the current record not yet consumed by READ.  */
   int compress;
   int compress_typesize;
+  /* Staging buffer: items arrive in small pieces (one array column at a
+     time), so data is collected here and compressed in large chunks
+     when the buffer is full, the element size changes or the record
+     ends.  cbuf_typesize is the element size of the staged data.  */
+  char *cbuf;
+  size_t cbuf_cap, cbuf_len;
+  int cbuf_typesize;
   char *zbuf;
   size_t zbuf_cap;
   char *dbuf;
