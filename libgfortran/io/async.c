@@ -171,7 +171,16 @@ struct async_spare {
 
 static struct async_spare *spare_pool = NULL;
 static size_t spare_pool_bytes = 0;
+static int spare_pool_count = 0;
 static __gthread_mutex_t spare_pool_lock = __GTHREAD_MUTEX_INIT;
+
+/* Only buffers of at least this size are worth pooling: page faults are
+   what the pool saves, and small buffers come cheaply from malloc.  The
+   pool holds at most this many buffers so that the best-fit scan in
+   async_copy_buffer stays short even when a program issues millions of
+   small items (one per array element when the compiler scalarizes).  */
+#define SPARE_MIN_BYTES ((size_t) 64 << 10)
+#define SPARE_MAX_COUNT 64
 
 /* Hand a released buffer to the pool or free it.  */
 
@@ -180,8 +189,14 @@ spare_release (void *buf, size_t cap)
 {
   size_t limit = options.async_copy_limit > 0
 		 ? (size_t) options.async_copy_limit << 20 : 0;
+  if (cap < SPARE_MIN_BYTES)
+    {
+      free (buf);
+      return;
+    }
   LOCK (&spare_pool_lock);
-  if (limit == 0 || spare_pool_bytes + cap <= limit)
+  if (spare_pool_count < SPARE_MAX_COUNT
+      && (limit == 0 || spare_pool_bytes + cap <= limit))
     {
       struct async_spare *s = xmalloc (sizeof (struct async_spare));
       s->buf = buf;
@@ -189,6 +204,7 @@ spare_release (void *buf, size_t cap)
       s->next = spare_pool;
       spare_pool = s;
       spare_pool_bytes += cap;
+      spare_pool_count++;
       buf = NULL;
     }
   UNLOCK (&spare_pool_lock);
@@ -620,6 +636,12 @@ async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
 {
   void *buf = NULL;
   struct async_spare **best = NULL, **pp;
+  if (nbytes < SPARE_MIN_BYTES)
+    {
+      /* Small items are never pooled; skip the lock and the scan.  */
+      *cap = nbytes;
+      return xmalloc (nbytes);
+    }
   LOCK (&spare_pool_lock);
   /* Best fit: the smallest pooled buffer that is large enough.  */
   for (pp = &spare_pool; *pp; pp = &(*pp)->next)
@@ -632,6 +654,7 @@ async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
       buf = s->buf;
       *cap = s->cap;
       spare_pool_bytes -= s->cap;
+      spare_pool_count--;
       free (s);
     }
   UNLOCK (&spare_pool_lock);
@@ -716,10 +739,11 @@ async_unpack_array (gfc_array_char *desc, size_t elem_bytes, const char *src)
   char *data;
 
   rank = GFC_DESCRIPTOR_RANK (desc);
+  index_type span = desc->span > 0 ? desc->span : (index_type) elem_bytes;
   for (n = 0; n < rank; n++)
     {
       count[n] = 0;
-      stride[n] = GFC_DESCRIPTOR_STRIDE_BYTES (desc, n);
+      stride[n] = GFC_DESCRIPTOR_STRIDE (desc, n) * span;
       extent[n] = GFC_DESCRIPTOR_EXTENT (desc, n);
       if (extent[n] <= 0)
 	return;
