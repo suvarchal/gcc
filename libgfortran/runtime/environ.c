@@ -76,6 +76,7 @@ typedef struct variable
 variable;
 
 static void init_unformatted (variable *);
+static void init_compress (variable *);
 static void init_async_io_cpus (variable *);
 
 
@@ -217,6 +218,9 @@ static variable variable_table[] = {
   { "GFORTRAN_ASYNC_COPY_THREADS", 0, &options.async_copy_threads,
     init_integer },
 
+  /* Blosc compression of unformatted sequential files:
+     codec[:level[:shuffle]].  */
+  { "GFORTRAN_COMPRESS", 0, NULL, init_compress },
   /* CPU list for the asynchronous I/O threads, or "all".  */
   { "GFORTRAN_ASYNC_IO_CPUS", 0, NULL, init_async_io_cpus },
 
@@ -238,6 +242,69 @@ init_variables (void)
 	*v->var = v->default_value;
       v->init (v);
     }
+}
+
+
+/* GFORTRAN_COMPRESS=codec[:level[:shuffle]] selects blosc compression of
+   unformatted sequential files.  codec is one of blosclz, lz4, lz4hc,
+   zlib, zstd, or none; level is 1..9 (default 5); shuffle is none, byte
+   or bit (default byte).  A malformed value disables compression.  */
+
+static char compress_codec_buf[16];
+
+static void
+init_compress (variable * v)
+{
+  char *p = getenv (v->name);
+  char *q;
+  size_t len;
+  static const char *const codecs[] =
+    { "blosclz", "lz4", "lz4hc", "zlib", "zstd", NULL };
+  int i;
+
+  options.compress_codec = NULL;
+  options.compress_level = 5;
+  options.compress_shuffle = 1;
+  if (p == NULL || *p == '\0')
+    return;
+
+  q = strchr (p, ':');
+  len = q ? (size_t) (q - p) : strlen (p);
+  if (len == 0 || len >= sizeof (compress_codec_buf))
+    return;
+  memcpy (compress_codec_buf, p, len);
+  compress_codec_buf[len] = '\0';
+  if (strcmp (compress_codec_buf, "none") == 0
+      || strcmp (compress_codec_buf, "off") == 0)
+    return;
+  for (i = 0; codecs[i]; i++)
+    if (strcmp (compress_codec_buf, codecs[i]) == 0)
+      break;
+  if (codecs[i] == NULL)
+    return;
+
+  if (q)
+    {
+      p = q + 1;
+      if (*p >= '0' && *p <= '9')
+	options.compress_level = *p - '0';
+      if (options.compress_level < 1)
+	options.compress_level = 1;
+      if (options.compress_level > 9)
+	options.compress_level = 9;
+      q = strchr (p, ':');
+      if (q)
+	{
+	  p = q + 1;
+	  if (strcmp (p, "none") == 0 || strcmp (p, "0") == 0)
+	    options.compress_shuffle = 0;
+	  else if (strcmp (p, "bit") == 0 || strcmp (p, "2") == 0)
+	    options.compress_shuffle = 2;
+	  else
+	    options.compress_shuffle = 1;
+	}
+    }
+  options.compress_codec = compress_codec_buf;
 }
 
 

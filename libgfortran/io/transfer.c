@@ -32,6 +32,9 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 #include "format.h"
 #include "unix.h"
 #include "async.h"
+#ifdef HAVE_BLOSC
+#include <blosc.h>
+#endif
 #include <string.h>
 #include <errno.h>
 
@@ -150,6 +153,12 @@ static void us_read (st_parameter_dt *, int);
 static void us_write (st_parameter_dt *, int);
 static void next_record_r_unf (st_parameter_dt *, int);
 static void next_record_w_unf (st_parameter_dt *, int);
+static bool write_buf_seq (st_parameter_dt *, void *, size_t);
+static void read_block_direct_seq (st_parameter_dt *, void *, size_t);
+#ifdef HAVE_BLOSC
+static bool write_buf_compressed (st_parameter_dt *, void *, size_t);
+static void read_block_direct_compressed (st_parameter_dt *, void *, size_t);
+#endif
 
 static const st_option advance_opt[] = {
   {"yes", ADVANCE_YES},
@@ -719,9 +728,32 @@ read_block_direct (st_parameter_dt *dtp, void *buf, size_t nbytes)
       return;
     }
 
-  /* Unformatted sequential.  We loop over the subrecords, reading
-     until the request has been fulfilled or the record has run out
-     of continuation subrecords.  */
+  /* Unformatted sequential.  */
+
+#ifdef HAVE_BLOSC
+  if (dtp->u.p.current_unit->compress)
+    {
+      read_block_direct_compressed (dtp, buf, nbytes);
+      return;
+    }
+#endif
+
+  read_block_direct_seq (dtp, buf, nbytes);
+}
+
+
+/* Unformatted sequential input.  We loop over the subrecords, reading
+   until the request has been fulfilled or the record has run out
+   of continuation subrecords.  */
+
+static void
+read_block_direct_seq (st_parameter_dt *dtp, void *buf, size_t nbytes)
+{
+  ssize_t to_read_record;
+  ssize_t have_read_record;
+  ssize_t to_read_subrecord;
+  ssize_t have_read_subrecord;
+  int short_record;
 
   /* Check whether we exceed the total record length.  */
 
@@ -886,6 +918,138 @@ write_block (st_parameter_dt *dtp, size_t length)
 }
 
 
+#ifdef HAVE_BLOSC
+
+/* Largest piece handed to blosc in one call; blosc itself allows a bit
+   under 2 GiB.  Every piece becomes one self-describing chunk.  */
+#define GFC_BLOSC_PIECE ((size_t) 1 << 30)
+
+static bool
+grow_buffer (char **buf, size_t *cap, size_t need)
+{
+  if (*cap >= need)
+    return true;
+  free (*buf);
+  *buf = malloc (need);
+  if (*buf == NULL)
+    {
+      *cap = 0;
+      return false;
+    }
+  *cap = need;
+  return true;
+}
+
+/* Compress NBYTES from BUF chunk by chunk and write the chunks into the
+   current unformatted sequential record.  The record markers count
+   compressed bytes; each chunk carries its own blosc header with the
+   uncompressed size, so the reader needs no further information.  */
+
+static bool
+write_buf_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  size_t off = 0;
+  int typesize = u->compress_typesize;
+
+  if (typesize < 1 || typesize > 255)
+    typesize = 1;
+
+  while (off < nbytes)
+    {
+      size_t piece = nbytes - off;
+      size_t need;
+      int cbytes;
+
+      if (piece > GFC_BLOSC_PIECE)
+	piece = GFC_BLOSC_PIECE;
+      need = piece + BLOSC_MAX_OVERHEAD;
+      if (!grow_buffer (&u->zbuf, &u->zbuf_cap, need))
+	{
+	  generate_error (&dtp->common, LIBERROR_OS, NULL);
+	  return false;
+	}
+      cbytes = blosc_compress_ctx (options.compress_level,
+				   options.compress_shuffle, typesize,
+				   piece, (char *) buf + off, u->zbuf, need,
+				   options.compress_codec, 0, 1);
+      if (cbytes <= 0)
+	{
+	  generate_error (&dtp->common, LIBERROR_OS,
+			  "Blosc compression failed");
+	  return false;
+	}
+      if (!write_buf_seq (dtp, u->zbuf, cbytes))
+	return false;
+      off += piece;
+    }
+  return true;
+}
+
+/* Deliver NBYTES of decompressed data into BUF from the current record,
+   reading and decompressing chunks as needed.  Data of a chunk not yet
+   consumed stays in u->dbuf for the following items of the statement.  */
+
+static void
+read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  size_t got = 0;
+
+  while (got < nbytes)
+    {
+      if (u->dbuf_pos < u->dbuf_len)
+	{
+	  size_t avail = u->dbuf_len - u->dbuf_pos;
+	  size_t take = nbytes - got < avail ? nbytes - got : avail;
+	  memcpy ((char *) buf + got, u->dbuf + u->dbuf_pos, take);
+	  u->dbuf_pos += take;
+	  got += take;
+	  continue;
+	}
+
+      /* Refill: one chunk.  */
+      {
+	char hdr[BLOSC_MIN_HEADER_LENGTH];
+	size_t nb, cb, bs;
+	int r;
+
+	read_block_direct_seq (dtp, hdr, sizeof (hdr));
+	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
+	  return;
+	blosc_cbuffer_sizes (hdr, &nb, &cb, &bs);
+	if (cb < sizeof (hdr) || nb > GFC_BLOSC_PIECE)
+	  {
+	    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+			    "Bad blosc chunk header");
+	    return;
+	  }
+	if (!grow_buffer (&u->zbuf, &u->zbuf_cap, cb)
+	    || !grow_buffer (&u->dbuf, &u->dbuf_cap, nb))
+	  {
+	    generate_error (&dtp->common, LIBERROR_OS, NULL);
+	    return;
+	  }
+	memcpy (u->zbuf, hdr, sizeof (hdr));
+	read_block_direct_seq (dtp, u->zbuf + sizeof (hdr), cb - sizeof (hdr));
+	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
+	  return;
+	r = blosc_decompress_ctx (u->zbuf, u->dbuf, nb, 1);
+	if (r < 0 || (size_t) r != nb)
+	  {
+	    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+			    "Blosc decompression failed");
+	    return;
+	  }
+	u->dbuf_len = nb;
+	u->dbuf_pos = 0;
+      }
+    }
+}
+
+#endif /* HAVE_BLOSC */
+
+
 /* High level interface to swrite(), taking care of errors.  This is only
    called for unformatted files.  There are three cases to consider:
    Stream I/O, unformatted direct, unformatted sequential.  */
@@ -941,6 +1105,25 @@ write_buf (st_parameter_dt *dtp, void *buf, size_t nbytes)
     }
 
   /* Unformatted sequential.  */
+
+#ifdef HAVE_BLOSC
+  if (dtp->u.p.current_unit->compress)
+    return write_buf_compressed (dtp, buf, nbytes);
+#endif
+
+  return write_buf_seq (dtp, buf, nbytes);
+}
+
+
+/* Unformatted sequential output of NBYTES from BUF into the current
+   record, splitting into subrecords as needed.  */
+
+static bool
+write_buf_seq (st_parameter_dt *dtp, void *buf, size_t nbytes)
+{
+  ssize_t have_written;
+  ssize_t to_write_subrecord;
+  int short_record;
 
   have_written = 0;
 
@@ -1309,6 +1492,8 @@ unformatted_write (st_parameter_dt *dtp, bt type,
       size_t stride = type == BT_CHARACTER ?
 		  size * GFC_SIZE_OF_CHAR_KIND(kind) : size;
 
+      dtp->u.p.current_unit->compress_typesize
+	= type == BT_CHARACTER ? 1 : type == BT_COMPLEX ? kind : (int) size;
       write_buf (dtp, source, stride * nelems);
     }
   else
@@ -1406,6 +1591,7 @@ unformatted_write (st_parameter_dt *dtp, bt type,
 	      bswap_array (buffer, p, size, nc);
 	      p += size * nc;
 	    }
+	  dtp->u.p.current_unit->compress_typesize = (int) size;
 	  write_buf (dtp, buffer, size * nc);
 	  nrem -= nc;
 	}
@@ -3286,6 +3472,34 @@ us_read (st_parameter_dt *dtp, int continued)
 	}
     }
 
+  /* A compressed file starts with a header record; step over it.  */
+  if (dtp->u.p.current_unit->compress && !continued
+      && i == GFC_BLOSC_MAGIC_LEN
+      && stell (dtp->u.p.current_unit->s) == (gfc_offset) n)
+    {
+      char magic[GFC_BLOSC_MAGIC_LEN];
+      if (sread (dtp->u.p.current_unit->s, magic, GFC_BLOSC_MAGIC_LEN)
+	  == GFC_BLOSC_MAGIC_LEN
+	  && memcmp (magic, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0)
+	{
+	  if (sseek (dtp->u.p.current_unit->s, n, SEEK_CUR) < 0)
+	    {
+	      generate_error (&dtp->common, LIBERROR_BAD_US, NULL);
+	      return;
+	    }
+	  us_read (dtp, 0);
+	  return;
+	}
+      generate_error (&dtp->common, LIBERROR_BAD_US, NULL);
+      return;
+    }
+
+  if (! continued)
+    {
+      dtp->u.p.current_unit->dbuf_len = 0;
+      dtp->u.p.current_unit->dbuf_pos = 0;
+    }
+
   if (i >= 0)
     {
       dtp->u.p.current_unit->bytes_left_subrecord = i;
@@ -3317,6 +3531,23 @@ us_write (st_parameter_dt *dtp, int continued)
     nbytes = sizeof (GFC_INTEGER_4);
   else
     nbytes = compile_options.record_marker ;
+
+  /* A compressed file starts with a header record identifying it.  */
+  if (dtp->u.p.current_unit->compress && !continued
+      && stell (dtp->u.p.current_unit->s) == 0)
+    {
+      if (swrite (dtp->u.p.current_unit->s, &dummy, nbytes) != nbytes
+	  || swrite (dtp->u.p.current_unit->s, GFC_BLOSC_MAGIC,
+		     GFC_BLOSC_MAGIC_LEN) != GFC_BLOSC_MAGIC_LEN)
+	{
+	  generate_error (&dtp->common, LIBERROR_OS, NULL);
+	  return;
+	}
+      dtp->u.p.current_unit->bytes_left_subrecord =
+	dtp->u.p.current_unit->recl_subrecord - GFC_BLOSC_MAGIC_LEN;
+      dtp->u.p.current_unit->continued = 0;
+      next_record_w_unf (dtp, 0);
+    }
 
   if (swrite (dtp->u.p.current_unit->s, &dummy, nbytes) != nbytes)
     generate_error (&dtp->common, LIBERROR_OS, NULL);

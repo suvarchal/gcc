@@ -914,6 +914,8 @@ close_unit_1 (gfc_unit *u, int locked, bool free_newunit)
   delete_unit (u);
 
   free (u->filename);
+  free (u->zbuf);
+  free (u->dbuf);
   u->filename = NULL;
 
   free_format_hash_table (u);

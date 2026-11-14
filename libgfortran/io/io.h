@@ -465,6 +465,11 @@ st_parameter_inquire;
 #define IOPARM_DT_HAS_SIGN			(1 << 24)
 #define IOPARM_DT_HAS_F2003                     (1 << 25)
 #define IOPARM_DT_HAS_UDTIO                     (1 << 26)
+
+/* Header record identifying a blosc-compressed unformatted sequential
+   file: a record of GFC_BLOSC_MAGIC_LEN bytes at the start of the file.  */
+#define GFC_BLOSC_MAGIC "GFORTRAN_BLOSC1"
+#define GFC_BLOSC_MAGIC_LEN 16
 #define IOPARM_DT_DEC_EXT			(1 << 27)
 /* Internal use bit.  */
 #define IOPARM_DT_IONML_SET			(1u << 31)
@@ -698,6 +703,18 @@ typedef struct gfc_unit
 
   /* Contains the pointer to the async unit.  */
   struct async_unit *au;
+
+  /* Blosc compression of unformatted sequential records
+     (GFORTRAN_COMPRESS).  compress: 0 off, 1 on.  compress_typesize is
+     the element size of the item being written, for the shuffle filter.
+     zbuf holds compressed data in transit; dbuf holds decompressed data
+     of the current record not yet consumed by READ.  */
+  int compress;
+  int compress_typesize;
+  char *zbuf;
+  size_t zbuf_cap;
+  char *dbuf;
+  size_t dbuf_cap, dbuf_len, dbuf_pos;
 
   __gthread_mutex_t lock;
   /* Number of threads waiting to acquire this unit's lock.

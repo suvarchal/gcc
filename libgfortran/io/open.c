@@ -689,6 +689,40 @@ new_unit (st_parameter_open *opp, gfc_unit *u, unit_flags *flags)
   else
     u->au = NULL;
 
+  /* Blosc compression of unformatted sequential files.  An existing
+     non-empty file decides for itself by its header record; a new or
+     empty file follows GFORTRAN_COMPRESS.  */
+  u->compress = 0;
+  u->dbuf_len = u->dbuf_pos = 0;
+  if (flags->form == FORM_UNFORMATTED && flags->access == ACCESS_SEQUENTIAL)
+    {
+      if (ssize (u->s) > 0)
+	{
+	  gfc_offset save = stell (u->s);
+	  size_t n = compile_options.record_marker == 0
+		     ? sizeof (GFC_INTEGER_4) : compile_options.record_marker;
+	  char hdr[8 + GFC_BLOSC_MAGIC_LEN];
+	  if (sseek (u->s, 0, SEEK_SET) >= 0
+	      && sread (u->s, hdr, n + GFC_BLOSC_MAGIC_LEN)
+		 == (ssize_t) (n + GFC_BLOSC_MAGIC_LEN)
+	      && memcmp (hdr + n, GFC_BLOSC_MAGIC, GFC_BLOSC_MAGIC_LEN) == 0)
+	    {
+#ifdef HAVE_BLOSC
+	      u->compress = 1;
+#else
+	      generate_error (&opp->common, LIBERROR_OS,
+			      "File is blosc-compressed but this libgfortran "
+			      "was built without blosc support");
+#endif
+	    }
+	  sseek (u->s, save, SEEK_SET);
+	}
+#ifdef HAVE_BLOSC
+      else if (options.compress_codec != NULL)
+	u->compress = 1;
+#endif
+    }
+
   return u;
 
  cleanup:

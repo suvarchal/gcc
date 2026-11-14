@@ -588,6 +588,7 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_ASYNC_COPY:: Copy data of asynchronous WRITE statements
 * GFORTRAN_ASYNC_COPY_LIMIT:: Limit for outstanding asynchronous copies
 * GFORTRAN_ASYNC_COPY_THREADS:: Threads for copying asynchronous output
+* GFORTRAN_COMPRESS:: Compress unformatted sequential files
 * GFORTRAN_ASYNC_IO_CPUS:: CPUs for the asynchronous I/O threads
 @end menu
 
@@ -822,6 +823,30 @@ large arrays the copy can take a noticeable fraction of the time a
 synchronous write would take; several threads bring it down to the
 memory bandwidth of the machine.  The threads only exist for the
 duration of the copy.  The default is 1.
+
+@node GFORTRAN_COMPRESS
+@section @env{GFORTRAN_COMPRESS}---Compress unformatted sequential files
+
+If GNU Fortran was built with blosc support, setting this variable to
+@code{@var{codec}[:@var{level}[:@var{shuffle}]]} makes every unformatted
+sequential file that is created or empty when opened a compressed file.
+@var{codec} is one of @code{blosclz}, @code{lz4}, @code{lz4hc},
+@code{zlib} or @code{zstd}, or @code{none} to disable compression;
+@var{level} is a digit from 1 to 9 (default 5); @var{shuffle} is
+@code{none}, @code{byte} (default) or @code{bit} and selects the blosc
+shuffle filter, which is applied with the element size of each item and
+is what makes floating-point data compress well.
+
+A compressed file starts with a record of 16 bytes identifying it, and
+every item of every record is stored as one blosc chunk; the record
+markers hold the compressed lengths, so @code{BACKSPACE} and record
+skipping work as usual.  Existing non-empty files decide for themselves:
+a compressed file is read as such whether or not the variable is set,
+and an uncompressed file is read uncompressed.  Files written with this
+variable set cannot be read by programs linked against a GNU Fortran
+runtime without blosc support, which report an error when opening them.
+Direct access, stream access and formatted files are not affected.
+The default is no compression.
 
 @node GFORTRAN_ASYNC_IO_CPUS
 @section @env{GFORTRAN_ASYNC_IO_CPUS}---CPUs for the asynchronous I/O threads
