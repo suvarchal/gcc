@@ -212,6 +212,10 @@ static variable variable_table[] = {
   /* Limit in MiB for outstanding copied asynchronous output per unit.  */
   { "GFORTRAN_ASYNC_COPY_LIMIT", 0, &options.async_copy_limit, init_integer },
 
+  /* Threads used to copy large items when GFORTRAN_ASYNC_COPY is set.  */
+  { "GFORTRAN_ASYNC_COPY_THREADS", 0, &options.async_copy_threads,
+    init_integer },
+
   { NULL, 0, NULL, NULL }
 };
 

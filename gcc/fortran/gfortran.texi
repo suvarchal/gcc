@@ -587,6 +587,7 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_UNFORMATTED_BUFFER_SIZE:: Buffer size for unformatted files
 * GFORTRAN_ASYNC_COPY:: Copy data of asynchronous WRITE statements
 * GFORTRAN_ASYNC_COPY_LIMIT:: Limit for outstanding asynchronous copies
+* GFORTRAN_ASYNC_COPY_THREADS:: Threads for copying asynchronous output
 @end menu
 
 @node TMPDIR
@@ -809,6 +810,17 @@ of copied output, in mebibytes, that may be outstanding per unit.  When a
 new asynchronous @code{WRITE} would exceed the limit, the statement first
 waits for the pending operations of its unit to complete.  A value of 0,
 the default, means no limit.
+
+@node GFORTRAN_ASYNC_COPY_THREADS
+@section @env{GFORTRAN_ASYNC_COPY_THREADS}---Threads for copying asynchronous output
+
+With @env{GFORTRAN_ASYNC_COPY} set, items of 8 MiB or more are copied
+by this many threads, one of them being the thread that executes the
+@code{WRITE} statement.  A single thread copies at a few GB/s, so for
+large arrays the copy can take a noticeable fraction of the time a
+synchronous write would take; several threads bring it down to the
+memory bandwidth of the machine.  The threads only exist for the
+duration of the copy.  The default is 1.
 
 @c =====================================================================
 @c PART II: LANGUAGE REFERENCE

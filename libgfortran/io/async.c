@@ -541,6 +541,67 @@ async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
   return xmalloc (nbytes);
 }
 
+/* Parallel memcpy for copy-on-enqueue.  Items of at least
+   ASYNC_COPY_PAR_MIN bytes are split across GFORTRAN_ASYNC_COPY_THREADS
+   threads, one chunk being copied by the calling thread.  The helper
+   threads are created per call; at this size their start-up cost is
+   negligible against the copy itself.  */
+
+#define ASYNC_COPY_PAR_MIN (8u << 20)
+#define ASYNC_COPY_MAX_THREADS 64
+
+struct copy_job
+{
+  void *dst;
+  const void *src;
+  size_t n;
+};
+
+static void *
+copy_job_run (void *arg)
+{
+  struct copy_job *j = arg;
+  memcpy (j->dst, j->src, j->n);
+  return NULL;
+}
+
+void
+async_copy_mem (void *dst, const void *src, size_t nbytes)
+{
+  int nthreads = options.async_copy_threads;
+  __gthread_t tid[ASYNC_COPY_MAX_THREADS];
+  struct copy_job job[ASYNC_COPY_MAX_THREADS];
+  size_t chunk, off;
+  int i, started;
+
+  if (nthreads > ASYNC_COPY_MAX_THREADS)
+    nthreads = ASYNC_COPY_MAX_THREADS;
+  if (nthreads < 2 || nbytes < ASYNC_COPY_PAR_MIN || !__gthread_active_p ())
+    {
+      memcpy (dst, src, nbytes);
+      return;
+    }
+
+  /* Chunks aligned to 4 KiB so that threads do not share pages.  */
+  chunk = (nbytes / nthreads + 4095) & ~(size_t) 4095;
+  started = 0;
+  off = 0;
+  for (i = 0; i < nthreads - 1 && off + chunk < nbytes; i++)
+    {
+      job[i].dst = (char *) dst + off;
+      job[i].src = (const char *) src + off;
+      job[i].n = chunk;
+      if (__gthread_create (&tid[i], copy_job_run, &job[i]) != 0)
+	break;
+      started++;
+      off += chunk;
+    }
+  /* The calling thread copies the remainder, then joins the helpers.  */
+  memcpy ((char *) dst + off, (const char *) src + off, nbytes - off);
+  for (i = 0; i < started; i++)
+    __gthread_join (tid[i], NULL);
+}
+
 /* Assign an ID to a statement on an asynchronous unit that was
    completed synchronously.  */
 
@@ -623,6 +684,13 @@ async_copy_buffer (async_unit *au, size_t nbytes, size_t *cap)
 {
   *cap = 0;
   return NULL;
+}
+
+/* Plain copy when there is no threading.  */
+void
+async_copy_mem (void *dst, const void *src, size_t nbytes)
+{
+  memcpy (dst, src, nbytes);
 }
 
 /* Do-nothing function, which will not be called.  */

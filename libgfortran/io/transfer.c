@@ -2731,6 +2731,28 @@ async_pack_array (gfc_array_char *desc, size_t elem_bytes, char *dest)
 
   chunk = stride[0] == (index_type) elem_bytes ? extent[0] : 1;
   data = GFC_DESCRIPTOR_DATA (desc);
+
+  /* Fully contiguous: a single copy, possibly multi-threaded.  */
+  if (chunk == extent[0])
+    {
+      size_t total = elem_bytes;
+      bool contig = true;
+      for (n = 0; n < rank; n++)
+	{
+	  if (stride[n] != (index_type) total)
+	    {
+	      contig = false;
+	      break;
+	    }
+	  total *= extent[n];
+	}
+      if (contig)
+	{
+	  async_copy_mem (dest, data, total);
+	  return;
+	}
+    }
+
   while (data)
     {
       memcpy (dest, data, chunk * elem_bytes);
@@ -2780,7 +2802,7 @@ wrap_scalar_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
 	      owned = async_copy_alloc (dtp, nbytes, &cap);
 	      if (owned)
 		{
-		  memcpy (owned, p, nbytes);
+		  async_copy_mem (owned, p, nbytes);
 		  p = owned;
 		}
 	    }

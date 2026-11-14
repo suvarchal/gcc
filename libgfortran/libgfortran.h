@@ -650,6 +650,9 @@ typedef struct
      (GFORTRAN_ASYNC_COPY) and the per-unit limit in MiB for outstanding
      copies (GFORTRAN_ASYNC_COPY_LIMIT, 0 = unlimited).  */
   int async_copy, async_copy_limit;
+  /* Number of threads used to copy large items in copy mode
+     (GFORTRAN_ASYNC_COPY_THREADS, 0 or 1 = the calling thread only).  */
+  int async_copy_threads;
 }
 options_t;
 

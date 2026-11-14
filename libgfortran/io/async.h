@@ -643,6 +643,9 @@ internal_proto (async_wait_id);
 void *async_copy_buffer (async_unit *, size_t, size_t *);
 internal_proto (async_copy_buffer);
 
+void async_copy_mem (void *, const void *, size_t);
+internal_proto (async_copy_mem);
+
 int async_complete_id (async_unit *);
 internal_proto (async_complete_id);
 
