@@ -830,6 +830,25 @@ LIBGFOR_CHECK_FMA4
 # Check if AVX128 works
 LIBGFOR_CHECK_AVX128
 
+# Compressed unformatted files (GFORTRAN_COMPRESS) need the c-blosc2
+# headers at build time; the library itself is loaded with dlopen.
+AC_ARG_WITH([blosc2],
+  [AS_HELP_STRING([--with-blosc2@<:@=DIR@:>@],
+    [support compressed unformatted files using the c-blosc2 headers
+     in DIR/include])],
+  [], [with_blosc2=no])
+if test "x$with_blosc2" != xno; then
+  if test "x$with_blosc2" != xyes; then
+    CPPFLAGS="$CPPFLAGS -I$with_blosc2/include"
+  fi
+  AC_CHECK_HEADERS([blosc2.h dlfcn.h], [],
+    [AC_MSG_ERROR([--with-blosc2 needs blosc2.h and dlfcn.h])])
+  AC_SEARCH_LIBS([dlopen], [dl], [],
+    [AC_MSG_ERROR([--with-blosc2 needs dlopen])])
+  AC_DEFINE([HAVE_BLOSC2], [1],
+    [Define to 1 to support compressed unformatted files with c-blosc2.])
+fi
+
 # Determine what GCC version number to use in filesystem paths.
 GCC_BASE_VER
 

@@ -114,6 +114,12 @@
 /* Define if AVX512f instructions can be compiled. */
 #undef HAVE_AVX512F
 
+/* Define to 1 to support compressed unformatted files with c-blosc2. */
+#undef HAVE_BLOSC2
+
+/* Define to 1 if you have the <blosc2.h> header file. */
+#undef HAVE_BLOSC2_H
+
 /* Define to 1 if you have the `cabs' function. */
 #undef HAVE_CABS
 

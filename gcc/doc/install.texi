@@ -2226,6 +2226,12 @@ is used.
 Specify that the Fortran front end and @code{libgfortran} do not add
 support for @code{libquadmath} on systems supporting it.
 
+@item --with-blosc2@r{[}=@var{dir}@r{]}
+Build @code{libgfortran} with support for compressed unformatted files
+(@env{GFORTRAN_COMPRESS}), using the c-blosc2 headers in
+@file{@var{dir}/include}.  The c-blosc2 library itself is not linked; it
+is loaded at run time when a program first needs it.
+
 @item --disable-libgomp
 Specify that the GNU Offloading and Multi Processing Runtime Library
 should not be built.
