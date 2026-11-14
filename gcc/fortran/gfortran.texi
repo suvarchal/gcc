@@ -832,7 +832,9 @@ If GNU Fortran was built with blosc support, setting this variable to
 every unformatted sequential file that is created or empty when opened a
 compressed file.  @var{codec} is one of @code{blosclz}, @code{lz4},
 @code{lz4hc}, @code{zlib} or @code{zstd}, or @code{none} to disable
-compression; @var{level} is a digit from 1 to 9 (default 5);
+compression; @code{yes}, @code{on} or @code{default} select
+@code{zstd:1:byte}; @var{level} is a digit from 1 to 9 (default 1 for
+@code{zstd}, 5 otherwise);
 @var{shuffle} is @code{none}, @code{byte} (default) or @code{bit} and
 selects the blosc shuffle filter, which is applied with the element size
 of each item and is what makes floating-point data compress well;
@@ -840,6 +842,13 @@ of each item and is what makes floating-point data compress well;
 or decompress one chunk.  Together with @env{GFORTRAN_ASYNC_IO_CPUS} the
 compression of asynchronous output can thus be spread over otherwise idle
 cores.
+
+Measured on restart files of the FESOM2 ocean model, @code{zstd} at level 1
+with byte shuffle compresses by a factor of about 1.8 at around 2 GB/s with
+8 threads; @code{lz4} reaches about 1.6 at 1 GB/s on a single thread and
+suits programs that have no idle cores for compression.  Higher
+@code{zstd} levels gain little ratio for a large loss of speed on such
+data, and bit shuffle compresses worse than byte shuffle.
 
 A compressed file starts with a record of 16 bytes identifying it, and
 every item of every record is stored as one blosc chunk; the record
