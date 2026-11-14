@@ -77,6 +77,7 @@ variable;
 
 static void init_unformatted (variable *);
 static void init_compress (variable *);
+static void init_compress_access (variable *);
 static void init_async_io_cpus (variable *);
 
 
@@ -221,6 +222,14 @@ static variable variable_table[] = {
   /* Blosc compression of unformatted sequential files:
      codec[:level[:shuffle]].  */
   { "GFORTRAN_COMPRESS", 0, NULL, init_compress },
+
+  /* Access modes to compress: sequential, stream, direct, all.  */
+  { "GFORTRAN_COMPRESS_ACCESS", 0, NULL, init_compress_access },
+
+  /* Chunk size in KiB of compressed stream and direct access files.  */
+  { "GFORTRAN_COMPRESS_CHUNK", 1024, &options.compress_chunk_kib,
+    init_integer },
+
   /* CPU list for the asynchronous I/O threads, or "all".  */
   { "GFORTRAN_ASYNC_IO_CPUS", 0, NULL, init_async_io_cpus },
 
@@ -242,6 +251,40 @@ init_variables (void)
 	*v->var = v->default_value;
       v->init (v);
     }
+}
+
+
+/* GFORTRAN_COMPRESS_ACCESS is a comma-separated list of the access modes
+   GFORTRAN_COMPRESS applies to: sequential, stream, direct or all.  The
+   default is sequential only, so that compressing restart files does not
+   change the stream and direct access files a program writes.  */
+
+static void
+init_compress_access (variable * v)
+{
+  const char *p = getenv (v->name);
+  int mask = 0;
+  options.compress_access = 1;
+  if (p == NULL || *p == '\0')
+    return;
+  while (*p)
+    {
+      size_t n = strcspn (p, ",");
+      if (n == 10 && strncmp (p, "sequential", n) == 0)
+	mask |= 1;
+      else if (n == 6 && strncmp (p, "stream", n) == 0)
+	mask |= 2;
+      else if (n == 6 && strncmp (p, "direct", n) == 0)
+	mask |= 4;
+      else if (n == 3 && strncmp (p, "all", n) == 0)
+	mask |= 7;
+      else
+	return;			/* Malformed: keep the default.  */
+      p += n;
+      if (*p == ',')
+	p++;
+    }
+  options.compress_access = mask;
 }
 
 

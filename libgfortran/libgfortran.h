@@ -657,6 +657,13 @@ typedef struct
      codec name or NULL for off, compression level and shuffle filter.  */
   const char *compress_codec;
   int compress_level, compress_shuffle, compress_threads;
+  /* Chunk size in KiB of compressed stream and direct access files
+     (GFORTRAN_COMPRESS_CHUNK, default 1024).  */
+  int compress_chunk_kib;
+  /* Access modes compressed when GFORTRAN_COMPRESS is set
+     (GFORTRAN_COMPRESS_ACCESS): bit 0 sequential, bit 1 stream,
+     bit 2 direct.  Default sequential only.  */
+  int compress_access;
   /* CPUs the asynchronous I/O threads may run on (GFORTRAN_ASYNC_IO_CPUS):
      NULL inherits the mask of the thread that opens the unit.  */
   const char *async_io_cpus;

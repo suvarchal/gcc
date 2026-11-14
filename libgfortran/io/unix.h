@@ -192,4 +192,11 @@ internal_proto(stream_isatty);
 extern int stream_ttyname (stream *, char *, size_t);
 internal_proto(stream_ttyname);
 
+#ifdef HAVE_BLOSC2
+extern stream *gfc_zstream_open (stream *, const char *, bool);
+internal_proto (gfc_zstream_open);
+extern bool gfc_zstream_is_frame (stream *);
+internal_proto (gfc_zstream_is_frame);
+#endif
+
 #endif

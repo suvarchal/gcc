@@ -2161,3 +2161,328 @@ stream_ttyname (stream *s  __attribute__ ((unused)),
      ENDFILE records are never explicitly stored.
 
 */
+
+#ifdef HAVE_BLOSC2
+/* Compressed stream: the logical byte space of a file opened for stream
+   or direct access is cut into fixed-size chunks, each stored as one
+   chunk of a c-blosc2 super-chunk in a contiguous frame file.  The chunk
+   being read or written is kept uncompressed in a cache and written back
+   when another chunk is touched, on flush and on close.  Every chunk is
+   stored at full size, zero-padded; the logical file size is kept in the
+   frame's variable-length metadata "gfortran_size".  The file is a plain
+   c-blosc2 frame: blosc2.open() in Python reads it.  */
+
+#include "zblosc.h"
+
+typedef struct
+{
+  stream st;
+  stream *under;		/* The unit's original stream, closed last.  */
+  blosc2_schunk *sc;
+  int64_t chunk;		/* Chunk size in bytes.  */
+  int64_t size, pos;
+  char *buf;			/* Cached chunk.  */
+  int64_t buf_idx;		/* Its index, -1 if none.  */
+  int dirty;
+  char *zbuf;			/* Compressed chunk for updates.  */
+}
+zstream;
+
+static int
+zs_writeback (zstream *z)
+{
+  if (!z->dirty)
+    return 0;
+  if (z->buf_idx < z->sc->nchunks)
+    {
+      int cb = gfc_b2.compress_ctx (z->sc->cctx, z->buf, (int32_t) z->chunk,
+				    z->zbuf,
+				    (int32_t) z->chunk + BLOSC2_MAX_OVERHEAD);
+      if (cb <= 0
+	  || gfc_b2.schunk_update_chunk (z->sc, z->buf_idx,
+					 (uint8_t *) z->zbuf, true) < 0)
+	return -1;
+    }
+  else
+    {
+      /* Chunks are stored densely: fill any gap with zero chunks.  */
+      if (z->sc->nchunks < z->buf_idx)
+	{
+	  char *zero = xcalloc (1, z->chunk);
+	  while (z->sc->nchunks < z->buf_idx)
+	    if (gfc_b2.schunk_append_buffer (z->sc, zero,
+					     (int32_t) z->chunk) < 0)
+	      {
+		free (zero);
+		return -1;
+	      }
+	  free (zero);
+	}
+      if (gfc_b2.schunk_append_buffer (z->sc, z->buf, (int32_t) z->chunk) < 0)
+	return -1;
+    }
+  z->dirty = 0;
+  return 0;
+}
+
+static int
+zs_load (zstream *z, int64_t idx)
+{
+  if (z->buf_idx == idx)
+    return 0;
+  if (zs_writeback (z) < 0)
+    return -1;
+  if (idx < z->sc->nchunks)
+    {
+      if (gfc_b2.schunk_decompress_chunk (z->sc, idx, z->buf,
+					  (int32_t) z->chunk) < 0)
+	return -1;
+    }
+  else
+    memset (z->buf, 0, z->chunk);
+  z->buf_idx = idx;
+  return 0;
+}
+
+static ssize_t
+zs_read (stream *s, void *buf, ssize_t nbyte)
+{
+  zstream *z = (zstream *) s;
+  ssize_t done = 0;
+  if (z->pos >= z->size)
+    return 0;
+  if (nbyte > z->size - z->pos)
+    nbyte = z->size - z->pos;
+  while (done < nbyte)
+    {
+      int64_t idx = z->pos / z->chunk, off = z->pos % z->chunk;
+      int64_t n = z->chunk - off;
+      if (n > nbyte - done)
+	n = nbyte - done;
+      if (zs_load (z, idx) < 0)
+	{
+	  errno = EIO;
+	  return -1;
+	}
+      memcpy ((char *) buf + done, z->buf + off, n);
+      done += n;
+      z->pos += n;
+    }
+  return done;
+}
+
+static ssize_t
+zs_write (stream *s, const void *buf, ssize_t nbyte)
+{
+  zstream *z = (zstream *) s;
+  ssize_t done = 0;
+  while (done < nbyte)
+    {
+      int64_t idx = z->pos / z->chunk, off = z->pos % z->chunk;
+      int64_t n = z->chunk - off;
+      if (n > nbyte - done)
+	n = nbyte - done;
+      if (zs_load (z, idx) < 0)
+	{
+	  errno = EIO;
+	  return -1;
+	}
+      memcpy (z->buf + off, (const char *) buf + done, n);
+      z->dirty = 1;
+      done += n;
+      z->pos += n;
+      if (z->pos > z->size)
+	z->size = z->pos;
+    }
+  return done;
+}
+
+static gfc_offset
+zs_seek (stream *s, gfc_offset offset, int whence)
+{
+  zstream *z = (zstream *) s;
+  gfc_offset base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? z->pos
+		    : z->size;
+  if (base + offset < 0)
+    {
+      errno = EINVAL;
+      return -1;
+    }
+  z->pos = base + offset;
+  return z->pos;
+}
+
+static gfc_offset
+zs_tell (stream *s)
+{
+  return ((zstream *) s)->pos;
+}
+
+static gfc_offset
+zs_size (stream *s)
+{
+  return ((zstream *) s)->size;
+}
+
+/* The logical size is stored msgpack-encoded (uint 64, 0xcf + 8 bytes
+   big endian), the convention python-blosc2 uses for metadata values.  */
+
+static int
+zs_store_size (zstream *z)
+{
+  uint8_t v[9];
+  int i;
+  v[0] = 0xcf;
+  for (i = 0; i < 8; i++)
+    v[1 + i] = (uint8_t) ((uint64_t) z->size >> (8 * (7 - i)));
+  if (gfc_b2.vlmeta_exists (z->sc, "gfortran_size") >= 0)
+    return gfc_b2.vlmeta_update (z->sc, "gfortran_size", v, 9, NULL) < 0
+	   ? -1 : 0;
+  return gfc_b2.vlmeta_add (z->sc, "gfortran_size", v, 9, NULL) < 0 ? -1 : 0;
+}
+
+static int
+zs_flush (stream *s)
+{
+  zstream *z = (zstream *) s;
+  if (zs_writeback (z) < 0 || zs_store_size (z) < 0)
+    {
+      errno = EIO;
+      return -1;
+    }
+  return 0;
+}
+
+static int
+zs_trunc (stream *s, gfc_offset length)
+{
+  zstream *z = (zstream *) s;
+  int64_t keep = (length + z->chunk - 1) / z->chunk;
+  if (zs_writeback (z) < 0)
+    return -1;
+  z->buf_idx = -1;
+  while (z->sc->nchunks > keep)
+    if (gfc_b2.schunk_delete_chunk (z->sc, z->sc->nchunks - 1) < 0)
+      return -1;
+  /* Zero the tail of the last kept chunk, so that extending the file
+     later reads zeros as with an ordinary file.  */
+  if (length % z->chunk && keep > 0 && keep - 1 < z->sc->nchunks)
+    {
+      if (zs_load (z, keep - 1) < 0)
+	return -1;
+      memset (z->buf + length % z->chunk, 0, z->chunk - length % z->chunk);
+      z->dirty = 1;
+    }
+  z->size = length;
+  if (z->pos > length)
+    z->pos = length;
+  return zs_flush (s);
+}
+
+static int
+zs_close (stream *s)
+{
+  zstream *z = (zstream *) s;
+  int ret = zs_flush (s);
+  gfc_b2.schunk_free (z->sc);
+  free (z->buf);
+  free (z->zbuf);
+  if (z->under && sclose (z->under) != 0)
+    ret = -1;
+  free (z);
+  return ret;
+}
+
+static int
+zs_markeor (stream *s __attribute__ ((unused)))
+{
+  return 0;
+}
+
+static const struct stream_vtable zs_vtable = {
+  .read = (void *) zs_read,
+  .write = (void *) zs_write,
+  .seek = (void *) zs_seek,
+  .tell = (void *) zs_tell,
+  .size = (void *) zs_size,
+  .trunc = (void *) zs_trunc,
+  .flush = (void *) zs_flush,
+  .close = (void *) zs_close,
+  .markeor = (void *) zs_markeor
+};
+
+/* Return true if the file starts like a c-blosc2 contiguous frame.  */
+
+bool
+gfc_zstream_is_frame (stream *s)
+{
+  char hdr[16];
+  gfc_offset save = stell (s);
+  bool r = false;
+  if (sseek (s, 0, SEEK_SET) >= 0 && sread (s, hdr, sizeof hdr) == sizeof hdr)
+    r = memmem (hdr, sizeof hdr, "b2frame", 7) != NULL;
+  sseek (s, save, SEEK_SET);
+  return r;
+}
+
+/* Wrap file PATH, already opened as UNDER, in a compressed stream:
+   open the existing frame if EXISTING, else create a new one.  Returns
+   NULL on failure, leaving UNDER untouched.  */
+
+stream *
+gfc_zstream_open (stream *under, const char *path, bool existing)
+{
+  zstream *z = xcalloc (1, sizeof (zstream));
+  if (existing)
+    {
+      uint8_t *content = NULL;
+      int32_t len = 0;
+      z->sc = gfc_b2.schunk_open (path);
+      if (!z->sc || z->sc->chunksize <= 0)
+	goto fail;
+      z->chunk = z->sc->chunksize;
+      if (gfc_b2.vlmeta_get (z->sc, "gfortran_size", &content, &len) >= 0
+	  && len == 9 && content[0] == 0xcf)
+	{
+	  int i;
+	  for (i = 1; i < 9; i++)
+	    z->size = (z->size << 8) | content[i];
+	}
+      else
+	z->size = z->sc->nbytes;
+      free (content);
+    }
+  else
+    {
+      blosc2_cparams cp = gfc_blosc2_cparams (8);
+      blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
+      blosc2_storage st = { .contiguous = true, .urlpath = (char *) path,
+			    .cparams = &cp, .dparams = &dp };
+      dp.nthreads = options.compress_threads;
+      /* OPEN has already created the file empty; c-blosc2 refuses to
+	 create a frame over an existing file.  The unit's original
+	 descriptor keeps referring to the removed empty file and is never
+	 written to.  */
+      unlink (path);
+      z->sc = gfc_b2.schunk_new (&st);
+      if (!z->sc)
+	goto fail;
+      z->chunk = (int64_t) (options.compress_chunk_kib > 0
+			    ? options.compress_chunk_kib : 1024) << 10;
+      if (zs_store_size (z) < 0)
+	goto fail;
+    }
+  z->buf = xmalloc (z->chunk);
+  z->zbuf = xmalloc (z->chunk + BLOSC2_MAX_OVERHEAD);
+  z->buf_idx = -1;
+  z->under = under;
+  z->st.vptr = &zs_vtable;
+  return (stream *) z;
+
+ fail:
+  if (z->sc)
+    gfc_b2.schunk_free (z->sc);
+  free (z);
+  return NULL;
+}
+#endif /* HAVE_BLOSC2 */

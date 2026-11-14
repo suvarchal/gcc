@@ -32,10 +32,8 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 #include "format.h"
 #include "unix.h"
 #include "async.h"
+#include "zblosc.h"
 #ifdef HAVE_BLOSC2
-/* Only the types and constants come from the header; the library itself
-   is loaded at run time with dlopen, see gfc_blosc2_available.  */
-#include <blosc2.h>
 #include <dlfcn.h>
 #endif
 #include <string.h>
@@ -933,20 +931,8 @@ write_block (st_parameter_dt *dtp, size_t length)
    own; the indirect call costs nanoseconds against milliseconds per chunk.
    GFORTRAN_BLOSC2_LIB names the library file explicitly.  */
 
-static struct
-{
-  int state;			/* 0 not tried, 1 loaded, -1 failed.  */
-  char err[256];
-  void (*init) (void);
-  blosc2_context *(*create_cctx) (blosc2_cparams);
-  blosc2_context *(*create_dctx) (blosc2_dparams);
-  void (*free_ctx) (blosc2_context *);
-  int (*compress_ctx) (blosc2_context *, const void *, int32_t, void *,
-		       int32_t);
-  int (*decompress_ctx) (blosc2_context *, const void *, int32_t, void *,
-			 int32_t);
-  const char *(*version) (void);
-} b2;
+gfc_blosc2_api gfc_b2;
+#define b2 gfc_b2
 
 static __gthread_mutex_t b2_lock = __GTHREAD_MUTEX_INIT;
 
@@ -982,6 +968,24 @@ b2_load (void)
   B2SYM (compress_ctx, "blosc2_compress_ctx");
   B2SYM (decompress_ctx, "blosc2_decompress_ctx");
   B2SYM (version, "blosc2_get_version_string");
+  B2SYM (schunk_new, "blosc2_schunk_new");
+  B2SYM (schunk_open, "blosc2_schunk_open");
+  B2SYM (schunk_free, "blosc2_schunk_free");
+  B2SYM (schunk_append_buffer, "blosc2_schunk_append_buffer");
+  B2SYM (schunk_update_chunk, "blosc2_schunk_update_chunk");
+  B2SYM (schunk_delete_chunk, "blosc2_schunk_delete_chunk");
+  B2SYM (schunk_decompress_chunk, "blosc2_schunk_decompress_chunk");
+  B2SYM (vlmeta_add, "blosc2_vlmeta_add");
+  B2SYM (vlmeta_update, "blosc2_vlmeta_update");
+  B2SYM (vlmeta_get, "blosc2_vlmeta_get");
+  B2SYM (vlmeta_exists, "blosc2_vlmeta_exists");
+  B2SYM (b2nd_create_ctx, "b2nd_create_ctx");
+  B2SYM (b2nd_free_ctx, "b2nd_free_ctx");
+  B2SYM (b2nd_from_cbuffer, "b2nd_from_cbuffer");
+  B2SYM (b2nd_to_cframe, "b2nd_to_cframe");
+  B2SYM (b2nd_from_cframe, "b2nd_from_cframe");
+  B2SYM (b2nd_to_cbuffer, "b2nd_to_cbuffer");
+  B2SYM (b2nd_free, "b2nd_free");
 #undef B2SYM
   /* The parameter structs are passed by value, so their layout must match
      the headers libgfortran was built with: require the same major
@@ -1044,6 +1048,24 @@ b2_compcode (const char *name)
   return BLOSC_ZSTD;
 }
 
+blosc2_cparams
+gfc_blosc2_cparams (int typesize)
+{
+  blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;
+  int k;
+  cp.compcode = b2_compcode (options.compress_codec
+			     ? options.compress_codec : "zstd");
+  cp.clevel = options.compress_codec ? options.compress_level : 1;
+  cp.typesize = typesize;
+  cp.nthreads = options.compress_threads;
+  for (k = 0; k < BLOSC2_MAX_FILTERS; k++)
+    cp.filters[k] = BLOSC_NOFILTER;
+  cp.filters[BLOSC2_MAX_FILTERS - 1]
+    = options.compress_shuffle == 2 ? BLOSC_BITSHUFFLE
+      : options.compress_shuffle == 0 ? BLOSC_NOFILTER : BLOSC_SHUFFLE;
+  return cp;
+}
+
 /* Compression context of unit U for element size TYPESIZE.  */
 
 static blosc2_context *
@@ -1058,17 +1080,7 @@ b2_cctx (gfc_unit *u, int typesize)
     }
   if (!u->zcctx[slot])
     {
-      blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;
-      int k;
-      cp.compcode = b2_compcode (options.compress_codec);
-      cp.clevel = options.compress_level;
-      cp.typesize = typesize;
-      cp.nthreads = options.compress_threads;
-      for (k = 0; k < BLOSC2_MAX_FILTERS; k++)
-	cp.filters[k] = BLOSC_NOFILTER;
-      cp.filters[BLOSC2_MAX_FILTERS - 1]
-	= options.compress_shuffle == 2 ? BLOSC_BITSHUFFLE
-	  : options.compress_shuffle == 1 ? BLOSC_SHUFFLE : BLOSC_NOFILTER;
+      blosc2_cparams cp = gfc_blosc2_cparams (typesize);
       u->zcctx[slot] = b2.create_cctx (cp);
       u->zcctx_typesize[slot] = typesize;
     }

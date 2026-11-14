@@ -589,6 +589,8 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_ASYNC_COPY_LIMIT:: Limit for outstanding asynchronous copies
 * GFORTRAN_ASYNC_COPY_THREADS:: Threads for copying asynchronous output
 * GFORTRAN_COMPRESS:: Compress unformatted sequential files
+* GFORTRAN_COMPRESS_ACCESS:: Access modes to compress
+* GFORTRAN_COMPRESS_CHUNK:: Chunk size of compressed stream and direct files
 * GFORTRAN_ASYNC_IO_CPUS:: CPUs for the asynchronous I/O threads
 @end menu
 
@@ -870,6 +872,34 @@ suitable library is found, a program that sets @env{GFORTRAN_COMPRESS}
 writes uncompressed files after a single warning, and opening a compressed
 file fails with a nonzero @code{IOSTAT} and a message naming the reason.
 Files written by earlier versions with c-blosc 1 remain readable.
+
+@node GFORTRAN_COMPRESS_ACCESS
+@section @env{GFORTRAN_COMPRESS_ACCESS}---Access modes to compress
+
+A comma-separated list of @code{sequential}, @code{stream} and
+@code{direct}, or @code{all}, naming the unformatted access modes that
+@env{GFORTRAN_COMPRESS} applies to.  The default is @code{sequential}.
+
+Compressed stream and direct access files are c-blosc2 contiguous frames:
+the file's bytes are cut into chunks of fixed size (see
+@env{GFORTRAN_COMPRESS_CHUNK}), each compressed separately, so that
+@code{POS=}, @code{REC=}, rewriting existing data, @code{POSITION='APPEND'}
+and @code{INQUIRE(SIZE=)} behave as for an ordinary file.  The chunk being
+read or written is kept uncompressed in memory and written back when
+another chunk is touched and when the unit is flushed or closed.  The
+logical file size is stored in the frame's metadata as
+@code{gfortran_size}, so such files can be opened directly with
+python-blosc2.  An existing file that is a c-blosc2 frame is always opened
+compressed.  Scratch files are never compressed.  Rewriting chunks in the
+middle of a file appends their new version to the frame, so files that
+are rewritten often grow.
+
+@node GFORTRAN_COMPRESS_CHUNK
+@section @env{GFORTRAN_COMPRESS_CHUNK}---Chunk size of compressed stream and direct files
+
+The chunk size in KiB of new compressed stream and direct access files;
+the default is 1024.  Smaller chunks make scattered access cheaper,
+larger chunks compress better.
 
 @node GFORTRAN_ASYNC_IO_CPUS
 @section @env{GFORTRAN_ASYNC_IO_CPUS}---CPUs for the asynchronous I/O threads

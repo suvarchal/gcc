@@ -723,7 +723,8 @@ new_unit (st_parameter_open *opp, gfc_unit *u, unit_flags *flags)
 	    }
 	  sseek (u->s, save, SEEK_SET);
 	}
-      else if (options.compress_codec != NULL)
+      else if (options.compress_codec != NULL
+	       && (options.compress_access & 1))
 	{
 	  static int warned = 0;
 	  if (gfc_blosc2_available ())
@@ -737,6 +738,44 @@ new_unit (st_parameter_open *opp, gfc_unit *u, unit_flags *flags)
 	    }
 	}
     }
+
+#ifdef HAVE_BLOSC2
+  /* Compressed stream and direct access: the unit's stream is replaced by
+     a compressed stream over a c-blosc2 frame file, below the record and
+     position logic, so POS=, REC= and rewrites work unchanged.  */
+  if (flags->form == FORM_UNFORMATTED
+      && (flags->access == ACCESS_STREAM || flags->access == ACCESS_DIRECT)
+      && flags->status != STATUS_SCRATCH && u->filename != NULL)
+    {
+      gfc_offset sz = ssize (u->s);
+      bool frame = sz > 0 && gfc_zstream_is_frame (u->s);
+      int bit = flags->access == ACCESS_STREAM ? 2 : 4;
+      if (frame || (sz == 0 && options.compress_codec != NULL
+		    && (options.compress_access & bit)))
+	{
+	  stream *z = gfc_blosc2_available ()
+		      ? gfc_zstream_open (u->s, u->filename, frame) : NULL;
+	  if (z != NULL)
+	    {
+	      u->s = z;
+	      if (flags->position == POSITION_APPEND)
+		sseek (u->s, 0, SEEK_END);
+	      if (flags->access == ACCESS_STREAM)
+		u->strm_pos = stell (u->s) + 1;
+	    }
+	  else if (frame)
+	    {
+	      char msg[512];
+	      snprintf (msg, sizeof msg, "File is a compressed c-blosc2 frame "
+			"but it could not be opened: %s",
+			gfc_blosc2_available () ? "invalid frame"
+			: gfc_blosc2_error ());
+	      errno = ENOSYS;
+	      generate_error (&opp->common, LIBERROR_OS, msg);
+	    }
+	}
+    }
+#endif
 
   return u;
 
