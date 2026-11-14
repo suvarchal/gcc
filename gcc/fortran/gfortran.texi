@@ -588,6 +588,7 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_ASYNC_COPY:: Copy data of asynchronous WRITE statements
 * GFORTRAN_ASYNC_COPY_LIMIT:: Limit for outstanding asynchronous copies
 * GFORTRAN_ASYNC_COPY_THREADS:: Threads for copying asynchronous output
+* GFORTRAN_ASYNC_IO_CPUS:: CPUs for the asynchronous I/O threads
 @end menu
 
 @node TMPDIR
@@ -821,6 +822,20 @@ large arrays the copy can take a noticeable fraction of the time a
 synchronous write would take; several threads bring it down to the
 memory bandwidth of the machine.  The threads only exist for the
 duration of the copy.  The default is 1.
+
+@node GFORTRAN_ASYNC_IO_CPUS
+@section @env{GFORTRAN_ASYNC_IO_CPUS}---CPUs for the asynchronous I/O threads
+
+A list of CPUs such as @code{16-31} or @code{8,10-11}, or @code{all}.
+The thread that performs the I/O of a unit opened with
+@code{ASYNCHRONOUS='YES'} is restricted to these CPUs.  By default the
+thread inherits the CPU affinity of the thread that executes the
+@code{OPEN}; when the program pins its OpenMP threads, for example with
+@env{OMP_PROC_BIND}, this is the place of one OpenMP thread, and the
+I/O thread then competes with that thread for a core while output is
+in flight.  Setting this variable to otherwise idle CPUs, for example the
+efficiency cores of a hybrid processor, avoids that.  Only supported on
+GNU/Linux; elsewhere the variable is ignored.
 
 @c =====================================================================
 @c PART II: LANGUAGE REFERENCE

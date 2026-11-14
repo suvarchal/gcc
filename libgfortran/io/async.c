@@ -38,6 +38,69 @@
 #include "async.h"
 #if ASYNC_IO
 
+#if defined(__linux__) && defined(_GNU_SOURCE)
+#include <sched.h>
+#include <pthread.h>
+#include <unistd.h>
+#define HAVE_ASYNC_IO_AFFINITY 1
+#endif
+
+/* Apply GFORTRAN_ASYNC_IO_CPUS to the calling (I/O) thread.  Malformed
+   lists are ignored.  */
+
+static void
+apply_io_thread_affinity (void)
+{
+#ifdef HAVE_ASYNC_IO_AFFINITY
+  const char *p = options.async_io_cpus;
+  cpu_set_t set;
+  long ncpu;
+  int any = 0;
+
+  if (p == NULL)
+    return;
+  ncpu = sysconf (_SC_NPROCESSORS_CONF);
+  if (ncpu <= 0 || ncpu > CPU_SETSIZE)
+    ncpu = CPU_SETSIZE;
+  CPU_ZERO (&set);
+  if (strcmp (p, "all") == 0)
+    {
+      for (long c = 0; c < ncpu; c++)
+	CPU_SET (c, &set);
+      any = 1;
+    }
+  else
+    while (*p)
+      {
+	char *end;
+	long a = strtol (p, &end, 10), b;
+	if (end == p)
+	  return;
+	b = a;
+	p = end;
+	if (*p == '-')
+	  {
+	    b = strtol (p + 1, &end, 10);
+	    if (end == p + 1)
+	      return;
+	    p = end;
+	  }
+	for (long c = a; c <= b; c++)
+	  if (c >= 0 && c < ncpu)
+	    {
+	      CPU_SET (c, &set);
+	      any = 1;
+	    }
+	if (*p == ',')
+	  p++;
+	else if (*p)
+	  return;
+      }
+  if (any)
+    pthread_setaffinity_np (pthread_self (), sizeof (set), &set);
+#endif
+}
+
 DEBUG_LINE (__thread const char *aio_prefix = MPREFIX);
 
 DEBUG_LINE (__gthread_mutex_t debug_queue_lock = __GTHREAD_MUTEX_INIT;)
@@ -141,6 +204,7 @@ async_io (void *arg)
   transfer_queue *ctq = NULL, *prev = NULL;
   gfc_unit *u = (gfc_unit *) arg;
   async_unit *au = u->au;
+  apply_io_thread_affinity ();
   LOCK (&au->lock);
   thread_unit = u;
   au->thread = __gthread_self ();

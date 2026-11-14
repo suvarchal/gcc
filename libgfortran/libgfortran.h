@@ -653,6 +653,9 @@ typedef struct
   /* Number of threads used to copy large items in copy mode
      (GFORTRAN_ASYNC_COPY_THREADS, 0 or 1 = the calling thread only).  */
   int async_copy_threads;
+  /* CPUs the asynchronous I/O threads may run on (GFORTRAN_ASYNC_IO_CPUS):
+     NULL inherits the mask of the thread that opens the unit.  */
+  const char *async_io_cpus;
 }
 options_t;
 

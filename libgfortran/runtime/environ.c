@@ -76,6 +76,7 @@ typedef struct variable
 variable;
 
 static void init_unformatted (variable *);
+static void init_async_io_cpus (variable *);
 
 
 /* Initialize an integer environment variable.  */
@@ -216,6 +217,9 @@ static variable variable_table[] = {
   { "GFORTRAN_ASYNC_COPY_THREADS", 0, &options.async_copy_threads,
     init_integer },
 
+  /* CPU list for the asynchronous I/O threads, or "all".  */
+  { "GFORTRAN_ASYNC_IO_CPUS", 0, NULL, init_async_io_cpus },
+
   { NULL, 0, NULL, NULL }
 };
 
@@ -234,6 +238,20 @@ init_variables (void)
 	*v->var = v->default_value;
       v->init (v);
     }
+}
+
+
+/* GFORTRAN_ASYNC_IO_CPUS is a CPU list such as "16-31,8" or "all".  The
+   asynchronous I/O thread of every unit is restricted to these CPUs.  By
+   default it inherits the affinity of the thread executing the OPEN,
+   which under OMP_PROC_BIND is one OpenMP thread's place, so the I/O
+   thread would then share a core with that thread.  */
+
+static void
+init_async_io_cpus (variable * v)
+{
+  char *p = getenv (v->name);
+  options.async_io_cpus = (p != NULL && *p != '\0') ? p : NULL;
 }
 
 
