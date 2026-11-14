@@ -162,6 +162,20 @@ static GTY(()) tree iocall[IOCALL_NUM];
    transfer is complete.  */
 static enum { READ, WRITE, IOLENGTH } last_dt;
 
+/* True while translating the items of a data transfer statement that has
+   ASYNCHRONOUS='YES' (or an ASYNCHRONOUS= value not known at compile
+   time).  The library then stores into the items of a READ after the
+   transfer call has returned, at some point before the matching WAIT, so
+   the data argument must be declared as escaping; otherwise the
+   optimizer may assume that the WAIT call cannot modify the item and
+   hoist loads or derived computations above it.  */
+static bool dt_async_stmt;
+
+/* Variants of the READ transfer functions with an escaping data
+   argument, used in asynchronous statements.  */
+static GTY(()) tree iocall_async[IOCALL_NUM];
+static tree read_iocall (int);
+
 /* The data transfer parameter block that should be shared by all
    data transfer calls belonging to the same read/write/iolength.  */
 static GTY(()) tree dt_parm;
@@ -426,6 +440,47 @@ gfc_build_io_library_fndecls (void)
   iocall[IOCALL_X_ARRAY_SPAN_WRITE]
     = gfc_build_library_function_decl_with_spec (
 	get_identifier (PREFIX("transfer_array_span_write")), ". w r . . ",
+	void_type_node, 4, dt_parm_type, pvoid_type_node,
+	integer_type_node, gfc_charlen_type_node);
+
+  /* Asynchronous READ variants: same library functions, but the data
+     argument escapes (spec '.'), see dt_async_stmt.  */
+  iocall_async[IOCALL_X_INTEGER] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_integer")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_UNSIGNED] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_unsigned")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_LOGICAL] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_logical")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_CHARACTER] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_character")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_charlen_type_node);
+  iocall_async[IOCALL_X_CHARACTER_WIDE] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_character_wide")), ". w . . . ",
+	void_type_node, 4, dt_parm_type, pvoid_type_node, gfc_charlen_type_node,
+	gfc_int4_type_node);
+  iocall_async[IOCALL_X_REAL] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_real")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_COMPLEX] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_complex")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_REAL128] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_real128")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_COMPLEX128] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_complex128")), ". w . . ",
+	void_type_node, 3, dt_parm_type, pvoid_type_node, gfc_int4_type_node);
+  iocall_async[IOCALL_X_ARRAY_SPAN]
+    = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_array_span")), ". w . . . ",
+	void_type_node, 4, dt_parm_type, pvoid_type_node,
+	integer_type_node, gfc_charlen_type_node);
+
+  iocall_async[IOCALL_X_ARRAY] = gfc_build_library_function_decl_with_spec (
+	get_identifier (PREFIX("transfer_array")), ". w . . . ",
 	void_type_node, 4, dt_parm_type, pvoid_type_node,
 	integer_type_node, gfc_charlen_type_node);
 
@@ -1958,8 +2013,19 @@ build_dt (tree function, gfc_code * code)
 	mask |= set_parameter_value (&block, var, IOPARM_dt_pos, dt->pos);
 
       if (dt->asynchronous)
-	mask |= set_string (&block, &post_block, var,
-			    IOPARM_dt_asynchronous, dt->asynchronous);
+	{
+	  mask |= set_string (&block, &post_block, var,
+			      IOPARM_dt_asynchronous, dt->asynchronous);
+	  /* Unless it is a constant that says no, assume the statement
+	     is asynchronous.  */
+	  dt_async_stmt = true;
+	  if (dt->asynchronous->expr_type == EXPR_CONSTANT
+	      && dt->asynchronous->ts.type == BT_CHARACTER
+	      && dt->asynchronous->value.character.length > 0
+	      && (dt->asynchronous->value.character.string[0] == 'n'
+		  || dt->asynchronous->value.character.string[0] == 'N'))
+	    dt_async_stmt = false;
+	}
 
       if (dt->blank)
 	mask |= set_string (&block, &post_block, var, IOPARM_dt_blank,
@@ -2129,6 +2195,7 @@ gfc_trans_dt_end (gfc_code * code)
   tree function, tmp;
   stmtblock_t block;
 
+  dt_async_stmt = false;
   gfc_init_block (&block);
 
   switch (last_dt)
@@ -2363,7 +2430,7 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
     case BT_INTEGER:
       arg2 = build_int_cst (integer_type_node, kind);
       if (last_dt == READ)
-	function = iocall[IOCALL_X_INTEGER];
+	function = read_iocall (IOCALL_X_INTEGER);
       else
 	function = iocall[IOCALL_X_INTEGER_WRITE];
 
@@ -2372,7 +2439,7 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
     case BT_UNSIGNED:
       arg2 = build_int_cst (unsigned_type_node, kind);
       if (last_dt == READ)
-	function = iocall[IOCALL_X_UNSIGNED];
+	function = read_iocall (IOCALL_X_UNSIGNED);
       else
 	function = iocall[IOCALL_X_UNSIGNED_WRITE];
 
@@ -2383,9 +2450,9 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
       if (last_dt == READ)
 	{
 	  if ((gfc_real16_is_float128 && kind == 16) || kind == 17)
-	    function = iocall[IOCALL_X_REAL128];
+	    function = read_iocall (IOCALL_X_REAL128);
 	  else
-	    function = iocall[IOCALL_X_REAL];
+	    function = read_iocall (IOCALL_X_REAL);
 	}
       else
 	{
@@ -2402,9 +2469,9 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
       if (last_dt == READ)
 	{
 	  if ((gfc_real16_is_float128 && kind == 16) || kind == 17)
-	    function = iocall[IOCALL_X_COMPLEX128];
+	    function = read_iocall (IOCALL_X_COMPLEX128);
 	  else
-	    function = iocall[IOCALL_X_COMPLEX];
+	    function = read_iocall (IOCALL_X_COMPLEX);
 	}
       else
 	{
@@ -2419,7 +2486,7 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
     case BT_LOGICAL:
       arg2 = build_int_cst (integer_type_node, kind);
       if (last_dt == READ)
-	function = iocall[IOCALL_X_LOGICAL];
+	function = read_iocall (IOCALL_X_LOGICAL);
       else
 	function = iocall[IOCALL_X_LOGICAL_WRITE];
 
@@ -2440,7 +2507,7 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
 	    }
 	  arg3 = build_int_cst (integer_type_node, kind);
 	  if (last_dt == READ)
-	    function = iocall[IOCALL_X_CHARACTER_WIDE];
+	    function = read_iocall (IOCALL_X_CHARACTER_WIDE);
 	  else
 	    function = iocall[IOCALL_X_CHARACTER_WIDE_WRITE];
 
@@ -2463,7 +2530,7 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
 	  arg2 = TYPE_MAX_VALUE (TYPE_DOMAIN (TREE_TYPE (tmp)));
 	}
       if (last_dt == READ)
-	function = iocall[IOCALL_X_CHARACTER];
+	function = read_iocall (IOCALL_X_CHARACTER);
       else
 	function = iocall[IOCALL_X_CHARACTER_WRITE];
 
@@ -2601,7 +2668,7 @@ transfer_array_desc (gfc_se * se, gfc_typespec * ts, tree addr_expr,
 
   tmp = gfc_build_addr_expr (NULL_TREE, dt_parm);
   if (last_dt == READ)
-    io_call = iocall[span ? IOCALL_X_ARRAY_SPAN : IOCALL_X_ARRAY];
+    io_call = read_iocall (span ? IOCALL_X_ARRAY_SPAN : IOCALL_X_ARRAY);
   else
     io_call = iocall[span ? IOCALL_X_ARRAY_SPAN_WRITE : IOCALL_X_ARRAY_WRITE];
 
@@ -2612,6 +2679,17 @@ transfer_array_desc (gfc_se * se, gfc_typespec * ts, tree addr_expr,
   gfc_add_block_to_block (&se->pre, &se->post);
 }
 
+
+/* Return the decl for READ transfer function IDX: the escaping variant
+   inside an asynchronous statement.  */
+
+static tree
+read_iocall (int idx)
+{
+  if (dt_async_stmt && iocall_async[idx] != NULL_TREE)
+    return iocall_async[idx];
+  return iocall[idx];
+}
 
 /* gfc_trans_transfer()-- Translate a TRANSFER code node */
 
