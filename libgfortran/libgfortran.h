@@ -656,7 +656,7 @@ typedef struct
   /* Blosc compression of unformatted sequential files (GFORTRAN_COMPRESS):
      codec name or NULL for off, compression level and shuffle filter.  */
   const char *compress_codec;
-  int compress_level, compress_shuffle;
+  int compress_level, compress_shuffle, compress_threads;
   /* CPUs the asynchronous I/O threads may run on (GFORTRAN_ASYNC_IO_CPUS):
      NULL inherits the mask of the thread that opens the unit.  */
   const char *async_io_cpus;

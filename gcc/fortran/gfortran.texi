@@ -828,14 +828,18 @@ duration of the copy.  The default is 1.
 @section @env{GFORTRAN_COMPRESS}---Compress unformatted sequential files
 
 If GNU Fortran was built with blosc support, setting this variable to
-@code{@var{codec}[:@var{level}[:@var{shuffle}]]} makes every unformatted
-sequential file that is created or empty when opened a compressed file.
-@var{codec} is one of @code{blosclz}, @code{lz4}, @code{lz4hc},
-@code{zlib} or @code{zstd}, or @code{none} to disable compression;
-@var{level} is a digit from 1 to 9 (default 5); @var{shuffle} is
-@code{none}, @code{byte} (default) or @code{bit} and selects the blosc
-shuffle filter, which is applied with the element size of each item and
-is what makes floating-point data compress well.
+@code{@var{codec}[:@var{level}[:@var{shuffle}[:@var{threads}]]]} makes
+every unformatted sequential file that is created or empty when opened a
+compressed file.  @var{codec} is one of @code{blosclz}, @code{lz4},
+@code{lz4hc}, @code{zlib} or @code{zstd}, or @code{none} to disable
+compression; @var{level} is a digit from 1 to 9 (default 5);
+@var{shuffle} is @code{none}, @code{byte} (default) or @code{bit} and
+selects the blosc shuffle filter, which is applied with the element size
+of each item and is what makes floating-point data compress well;
+@var{threads} (default 1) is the number of threads blosc uses to compress
+or decompress one chunk.  Together with @env{GFORTRAN_ASYNC_IO_CPUS} the
+compression of asynchronous output can thus be spread over otherwise idle
+cores.
 
 A compressed file starts with a record of 16 bytes identifying it, and
 every item of every record is stored as one blosc chunk; the record

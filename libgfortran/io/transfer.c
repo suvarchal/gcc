@@ -968,7 +968,7 @@ write_chunk_compressed (st_parameter_dt *dtp, const void *buf, size_t piece,
   cbytes = blosc_compress_ctx (options.compress_level,
 			       options.compress_shuffle, typesize, piece,
 			       buf, u->zbuf, need, options.compress_codec,
-			       0, 1);
+			       0, options.compress_threads);
   if (cbytes <= 0)
     {
       generate_error (&dtp->common, LIBERROR_OS, "Blosc compression failed");
@@ -1097,7 +1097,7 @@ read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
 	read_block_direct_seq (dtp, u->zbuf + sizeof (hdr), cb - sizeof (hdr));
 	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
 	  return;
-	r = blosc_decompress_ctx (u->zbuf, u->dbuf, nb, 1);
+	r = blosc_decompress_ctx (u->zbuf, u->dbuf, nb, options.compress_threads);
 	if (r < 0 || (size_t) r != nb)
 	  {
 	    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,

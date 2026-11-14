@@ -245,10 +245,12 @@ init_variables (void)
 }
 
 
-/* GFORTRAN_COMPRESS=codec[:level[:shuffle]] selects blosc compression of
-   unformatted sequential files.  codec is one of blosclz, lz4, lz4hc,
-   zlib, zstd, or none; level is 1..9 (default 5); shuffle is none, byte
-   or bit (default byte).  A malformed value disables compression.  */
+/* GFORTRAN_COMPRESS=codec[:level[:shuffle[:threads]]] selects blosc
+   compression of unformatted sequential files.  codec is one of blosclz,
+   lz4, lz4hc, zlib, zstd, or none; level is 1..9 (default 5); shuffle is
+   none, byte or bit (default byte); threads is the number of threads blosc
+   uses inside one chunk (default 1).  A malformed value disables
+   compression.  */
 
 static char compress_codec_buf[16];
 
@@ -265,6 +267,7 @@ init_compress (variable * v)
   options.compress_codec = NULL;
   options.compress_level = 5;
   options.compress_shuffle = 1;
+  options.compress_threads = 1;
   if (p == NULL || *p == '\0')
     return;
 
@@ -296,12 +299,20 @@ init_compress (variable * v)
       if (q)
 	{
 	  p = q + 1;
-	  if (strcmp (p, "none") == 0 || strcmp (p, "0") == 0)
+	  if (strncmp (p, "none", 4) == 0 || *p == '0')
 	    options.compress_shuffle = 0;
-	  else if (strcmp (p, "bit") == 0 || strcmp (p, "2") == 0)
+	  else if (strncmp (p, "bit", 3) == 0 || *p == '2')
 	    options.compress_shuffle = 2;
 	  else
 	    options.compress_shuffle = 1;
+	  q = strchr (p, ':');
+	  if (q)
+	    {
+	      /* Fourth field: blosc internal threads.  */
+	      int t = atoi (q + 1);
+	      if (t >= 1 && t <= 256)
+		options.compress_threads = t;
+	    }
 	}
     }
   options.compress_codec = compress_codec_buf;
