@@ -664,6 +664,8 @@ typedef struct
      (GFORTRAN_COMPRESS_ACCESS): bit 0 sequential, bit 1 stream,
      bit 2 direct.  Default sequential only.  */
   int compress_access;
+  /* GFORTRAN_COMPRESS_LAYOUT: 0 flat chunks, 1 shape-aware b2nd items.  */
+  int compress_layout;
   /* CPUs the asynchronous I/O threads may run on (GFORTRAN_ASYNC_IO_CPUS):
      NULL inherits the mask of the thread that opens the unit.  */
   const char *async_io_cpus;

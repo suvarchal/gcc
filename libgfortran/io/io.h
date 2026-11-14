@@ -737,6 +737,10 @@ typedef struct gfc_unit
   void *zcctx[6];
   int zcctx_typesize[6];
   void *zdctx;
+  /* A 16-byte item header read ahead while looking for a shape-aware
+     item, to be used by the next chunk refill.  */
+  int zhdr_pending;
+  unsigned char zhdr[16];
 
   __gthread_mutex_t lock;
   /* Number of threads waiting to acquire this unit's lock.

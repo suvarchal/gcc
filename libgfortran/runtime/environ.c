@@ -78,6 +78,7 @@ variable;
 static void init_unformatted (variable *);
 static void init_compress (variable *);
 static void init_compress_access (variable *);
+static void init_compress_layout (variable *);
 static void init_async_io_cpus (variable *);
 
 
@@ -223,6 +224,9 @@ static variable variable_table[] = {
      codec[:level[:shuffle]].  */
   { "GFORTRAN_COMPRESS", 0, NULL, init_compress },
 
+  /* Layout of compressed sequential array items: flat or nd.  */
+  { "GFORTRAN_COMPRESS_LAYOUT", 0, NULL, init_compress_layout },
+
   /* Access modes to compress: sequential, stream, direct, all.  */
   { "GFORTRAN_COMPRESS_ACCESS", 0, NULL, init_compress_access },
 
@@ -251,6 +255,18 @@ init_variables (void)
 	*v->var = v->default_value;
       v->init (v);
     }
+}
+
+
+/* GFORTRAN_COMPRESS_LAYOUT=nd writes array items of compressed sequential
+   files as c-blosc2 n-dimensional containers carrying shape and type;
+   flat (the default) writes byte chunks.  */
+
+static void
+init_compress_layout (variable * v)
+{
+  const char *p = getenv (v->name);
+  options.compress_layout = p != NULL && strcmp (p, "nd") == 0;
 }
 
 

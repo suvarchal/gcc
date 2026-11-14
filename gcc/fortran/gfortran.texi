@@ -590,6 +590,7 @@ Malformed environment variables are silently ignored.
 * GFORTRAN_ASYNC_COPY_THREADS:: Threads for copying asynchronous output
 * GFORTRAN_COMPRESS:: Compress unformatted sequential files
 * GFORTRAN_COMPRESS_ACCESS:: Access modes to compress
+* GFORTRAN_COMPRESS_LAYOUT:: Shape-aware array items in compressed files
 * GFORTRAN_COMPRESS_CHUNK:: Chunk size of compressed stream and direct files
 * GFORTRAN_ASYNC_IO_CPUS:: CPUs for the asynchronous I/O threads
 @end menu
@@ -893,6 +894,23 @@ python-blosc2.  An existing file that is a c-blosc2 frame is always opened
 compressed.  Scratch files are never compressed.  Rewriting chunks in the
 middle of a file appends their new version to the frame, so files that
 are rewritten often grow.
+
+@node GFORTRAN_COMPRESS_LAYOUT
+@section @env{GFORTRAN_COMPRESS_LAYOUT}---Shape-aware array items in compressed files
+
+With the value @code{nd}, array items of numeric or logical type written
+to a compressed unformatted sequential file are stored as c-blosc2
+n-dimensional (b2nd) frames that record the array's shape and element
+type: the Fortran shape reversed, so that in C order the bytes are
+unchanged, and a numpy type string such as @code{<f8}.  Blocks hold 8
+elements along the first dimension and about 512 KiB in total.  Such
+items can be read from Python with python-blosc2, for example with
+@code{blosc2.ndarray_from_cframe}, and transposed to the Fortran shape.
+Scalars and character items are stored as before.  Reading accepts any
+sequence of items that would be valid on an uncompressed file, including
+a different type or shape and a prefix of the item.  The default,
+@code{flat}, stores all data in byte chunks, which compresses about as
+well on model fields and decompresses several times faster.
 
 @node GFORTRAN_COMPRESS_CHUNK
 @section @env{GFORTRAN_COMPRESS_CHUNK}---Chunk size of compressed stream and direct files

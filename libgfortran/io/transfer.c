@@ -1099,6 +1099,9 @@ b2_dctx (gfc_unit *u)
   return u->zdctx;
 }
 
+/* Header of a shape-aware array item, see nd_write.  */
+#define GFC_ND_MAGIC "GFB2ND\0\1"
+
 /* Largest piece handed to blosc in one call; blosc itself allows a bit
    under 2 GiB.  Every piece becomes one self-describing chunk.  */
 #define GFC_BLOSC_PIECE ((size_t) 1 << 30)
@@ -1257,9 +1260,56 @@ read_block_direct_compressed (st_parameter_dt *dtp, void *buf, size_t nbytes)
 	int r;
 	blosc2_context *dc;
 
-	read_block_direct_seq (dtp, hdr, sizeof (hdr));
+	if (u->zhdr_pending)
+	  {
+	    memcpy (hdr, u->zhdr, sizeof (hdr));
+	    u->zhdr_pending = 0;
+	  }
+	else
+	  read_block_direct_seq (dtp, hdr, sizeof (hdr));
 	if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
 	  return;
+	if (memcmp (hdr, GFC_ND_MAGIC, 8) == 0)
+	  {
+	    /* A shape-aware array item read in some other way than as the
+	       same array (scalars, another type, a prefix): serve its bytes
+	       like those of any chunk.  */
+	    int64_t flen = 0, nbytes;
+	    int k;
+	    b2nd_array_t *arr = NULL;
+	    for (k = 7; k >= 0; k--)
+	      flen = (flen << 8) | hdr[8 + k];
+	    if (flen <= 0 || !grow_buffer (&u->zbuf, &u->zbuf_cap, flen))
+	      {
+		generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+				"Bad b2nd item header");
+		return;
+	      }
+	    read_block_direct_seq (dtp, u->zbuf, (size_t) flen);
+	    if ((dtp->common.flags & IOPARM_LIBRETURN_MASK)
+		!= IOPARM_LIBRETURN_OK)
+	      return;
+	    if (gfc_b2.b2nd_from_cframe ((uint8_t *) u->zbuf, flen, false,
+					 &arr) < 0)
+	      {
+		generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+				"Bad b2nd frame");
+		return;
+	      }
+	    nbytes = arr->nitems * (int64_t) arr->sc->typesize;
+	    if (!grow_buffer (&u->dbuf, &u->dbuf_cap, nbytes)
+		|| gfc_b2.b2nd_to_cbuffer (arr, u->dbuf, nbytes) < 0)
+	      {
+		gfc_b2.b2nd_free (arr);
+		generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+				"b2nd decompression failed");
+		return;
+	      }
+	    gfc_b2.b2nd_free (arr);
+	    u->dbuf_len = nbytes;
+	    u->dbuf_pos = 0;
+	    continue;
+	  }
 	/* The first 16 bytes of a chunk have the same layout in c-blosc 1
 	   and c-blosc2: uncompressed size at offset 4, compressed size at
 	   offset 12, little endian.  Decoding them here means only the
@@ -3412,6 +3462,285 @@ transfer_complex_write (st_parameter_dt *dtp, void *p, int kind)
   transfer_complex (dtp, p, kind);
 }
 
+
+#ifdef HAVE_BLOSC2
+/* Shape-aware array items (GFORTRAN_COMPRESS_LAYOUT=nd).  In a compressed
+   unformatted sequential file an array item is stored as a 16-byte header,
+   "GFB2ND" 0 1 followed by the frame length as a little-endian 64-bit
+   integer, and a c-blosc2 b2nd frame holding the array with its shape and
+   numpy type.  The shape is the Fortran shape reversed (C order), so the
+   bytes are unchanged.  A c-blosc chunk never starts with 'G', so readers
+   tell the two apart from the first byte.  */
+
+static const char *
+nd_dtype (bt type, int kind, size_t size)
+{
+  switch (type)
+    {
+    case BT_REAL:
+      return size == 4 ? "<f4" : size == 8 ? "<f8" : NULL;
+    case BT_COMPLEX:
+      return size == 8 ? "<c8" : size == 16 ? "<c16" : NULL;
+    case BT_INTEGER:
+    case BT_LOGICAL:
+      return size == 1 ? "|i1" : size == 2 ? "<i2" : size == 4 ? "<i4"
+	     : size == 8 ? "<i8" : NULL;
+    default:
+      return NULL;
+    }
+  (void) kind;
+}
+
+/* Scatter SRC, the elements of DESC in array element order, into DESC.  */
+
+static void
+nd_scatter (gfc_array_char *desc, size_t elem, const char *src)
+{
+  index_type count[GFC_MAX_DIMENSIONS], extent[GFC_MAX_DIMENSIONS];
+  index_type stride[GFC_MAX_DIMENSIONS], rank, n, chunk;
+  char *data;
+  index_type span = desc->span > 0 ? desc->span : (index_type) elem;
+  rank = GFC_DESCRIPTOR_RANK (desc);
+  for (n = 0; n < rank; n++)
+    {
+      count[n] = 0;
+      stride[n] = GFC_DESCRIPTOR_STRIDE (desc, n) * span;
+      extent[n] = GFC_DESCRIPTOR_EXTENT (desc, n);
+    }
+  chunk = stride[0] == (index_type) elem ? extent[0] : 1;
+  data = GFC_DESCRIPTOR_DATA (desc);
+  while (data)
+    {
+      memcpy (data, src, chunk * elem);
+      src += chunk * elem;
+      data += stride[0] * chunk;
+      count[0] += chunk;
+      n = 0;
+      while (count[n] == extent[n])
+	{
+	  count[n] = 0;
+	  data -= stride[n] * extent[n];
+	  if (++n == rank)
+	    {
+	      data = NULL;
+	      break;
+	    }
+	  count[n]++;
+	  data += stride[n];
+	}
+    }
+}
+
+/* True if DESC describes one contiguous block in array element order.  */
+
+static bool
+nd_contiguous (gfc_array_char *desc, size_t elem)
+{
+  index_type n, expect = elem;
+  index_type span = desc->span > 0 ? desc->span : (index_type) elem;
+  for (n = 0; n < GFC_DESCRIPTOR_RANK (desc); n++)
+    {
+      if (GFC_DESCRIPTOR_STRIDE (desc, n) * span != expect)
+	return false;
+      expect *= GFC_DESCRIPTOR_EXTENT (desc, n);
+    }
+  return true;
+}
+
+/* Write array item DESC as a b2nd frame.  Returns false if the item is
+   not eligible, true if it was handled (successfully or with an error
+   already reported).  */
+
+static bool
+nd_write (st_parameter_dt *dtp, gfc_array_char *desc, bt type, int kind,
+	  size_t elem)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  const char *dtype = nd_dtype (type, kind, elem);
+  int rank = GFC_DESCRIPTOR_RANK (desc), n;
+  int64_t shape[GFC_MAX_DIMENSIONS];
+  int32_t cshape[GFC_MAX_DIMENSIONS], bshape[GFC_MAX_DIMENSIONS];
+  int64_t nelem = 1, total;
+  char *buf;
+  bool own = false;
+  b2nd_context_t *ctx;
+  b2nd_array_t *arr = NULL;
+  uint8_t *frame = NULL;
+  int64_t flen = 0;
+  bool needs_free = false;
+  unsigned char hdr[16];
+  blosc2_cparams cp;
+  blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
+  blosc2_storage st = { .contiguous = true };
+
+  if (dtype == NULL || rank < 1 || rank > 8)
+    return false;
+  if (u->flags.convert != GFC_CONVERT_NATIVE)
+    return false;
+  for (n = 0; n < rank; n++)
+    {
+      shape[rank - 1 - n] = GFC_DESCRIPTOR_EXTENT (desc, n);
+      nelem *= shape[rank - 1 - n];
+    }
+  total = nelem * (int64_t) elem;
+  if (total <= 0)
+    return false;
+
+  /* Chunk: the whole array, split along the slowest dimension if it would
+     exceed 1 GiB.  Blocks: 8 along the fastest (Fortran first) dimension
+     when there are several dimensions, then about 512 KiB, the layout that
+     compressed best on FESOM2 fields.  */
+  {
+    int64_t row = total / shape[0];
+    int64_t rows = shape[0];
+    if (total > ((int64_t) 1 << 30))
+      rows = ((int64_t) 1 << 30) / row > 0 ? ((int64_t) 1 << 30) / row : 1;
+    cshape[0] = (int32_t) rows;
+    for (n = 1; n < rank; n++)
+      cshape[n] = (int32_t) shape[n];
+    int64_t room = (512 << 10) / (int64_t) elem;
+    for (n = rank - 1; n >= 0; n--)
+      {
+	int64_t b = (n == rank - 1 && rank > 1) ? 8 : room;
+	if (b > cshape[n])
+	  b = cshape[n];
+	if (b < 1)
+	  b = 1;
+	bshape[n] = (int32_t) b;
+	room = room / b > 0 ? room / b : 1;
+      }
+  }
+
+  if (nd_contiguous (desc, elem))
+    buf = GFC_DESCRIPTOR_DATA (desc);
+  else
+    {
+      buf = xmalloc (total);
+      own = true;
+      async_pack_array (desc, elem, buf);
+    }
+
+  cp = gfc_blosc2_cparams ((int) elem);
+  dp.nthreads = options.compress_threads;
+  st.cparams = &cp;
+  st.dparams = &dp;
+  ctx = gfc_b2.b2nd_create_ctx (&st, (int8_t) rank, shape, cshape, bshape,
+				dtype, DTYPE_NUMPY_FORMAT, NULL, 0);
+  if (ctx == NULL
+      || gfc_b2.b2nd_from_cbuffer (ctx, &arr, buf, total) < 0
+      || gfc_b2.b2nd_to_cframe (arr, &frame, &flen, &needs_free) < 0)
+    {
+      errno = EIO;
+      generate_error (&dtp->common, LIBERROR_OS,
+		      "Could not write array as a c-blosc2 b2nd frame");
+      goto out;
+    }
+  /* Keep the item order: whatever is staged goes first.  */
+  if (!flush_compressed (dtp))
+    goto out;
+  memcpy (hdr, GFC_ND_MAGIC, 8);
+  for (n = 0; n < 8; n++)
+    hdr[8 + n] = (unsigned char) ((uint64_t) flen >> (8 * n));
+  if (write_buf_seq (dtp, hdr, 16))
+    write_buf_seq (dtp, frame, (size_t) flen);
+
+ out:
+  if (needs_free)
+    free (frame);
+  if (arr)
+    gfc_b2.b2nd_free (arr);
+  if (ctx)
+    gfc_b2.b2nd_free_ctx (ctx);
+  if (own)
+    free (buf);
+  return true;
+}
+
+/* Read array item DESC if the next item of the record is a b2nd frame.
+   Returns false, with the read-ahead header kept for the chunk reader, if
+   it is not.  */
+
+static bool
+nd_read (st_parameter_dt *dtp, gfc_array_char *desc, size_t elem)
+{
+  gfc_unit *u = dtp->u.p.current_unit;
+  int64_t flen = 0, nelem = 1, total;
+  b2nd_array_t *arr = NULL;
+  char *buf;
+  bool own = false;
+  int n, rank = GFC_DESCRIPTOR_RANK (desc);
+
+  /* Only at an item boundary: nothing decompressed is left over.  */
+  if (u->dbuf_pos < u->dbuf_len || u->zhdr_pending)
+    return false;
+  if (!u->continued && u->bytes_left_subrecord < 16)
+    return false;
+  read_block_direct_seq (dtp, u->zhdr, 16);
+  if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
+    return true;
+  if (memcmp (u->zhdr, GFC_ND_MAGIC, 8) != 0)
+    {
+      u->zhdr_pending = 1;
+      return false;
+    }
+  for (n = 7; n >= 0; n--)
+    flen = (flen << 8) | u->zhdr[8 + n];
+  for (n = 0; n < rank; n++)
+    nelem *= GFC_DESCRIPTOR_EXTENT (desc, n);
+  total = nelem * (int64_t) elem;
+  if (flen <= 0 || !grow_buffer (&u->zbuf, &u->zbuf_cap, flen))
+    {
+      generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+		      "Bad b2nd item header");
+      return true;
+    }
+  read_block_direct_seq (dtp, u->zbuf, (size_t) flen);
+  if ((dtp->common.flags & IOPARM_LIBRETURN_MASK) != IOPARM_LIBRETURN_OK)
+    return true;
+  if (gfc_b2.b2nd_from_cframe ((uint8_t *) u->zbuf, flen, false, &arr) < 0)
+    {
+      generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+		      "Bad b2nd frame");
+      return true;
+    }
+  if (arr->nitems * (int64_t) arr->sc->typesize != total)
+    {
+      /* Not the same number of bytes: serve the item's bytes through the
+	 general reader, which follows the semantics of an uncompressed
+	 record (reading a prefix is allowed, reading past the record is
+	 an error).  */
+      int64_t nbytes = arr->nitems * (int64_t) arr->sc->typesize;
+      if (!grow_buffer (&u->dbuf, &u->dbuf_cap, nbytes)
+	  || gfc_b2.b2nd_to_cbuffer (arr, u->dbuf, nbytes) < 0)
+	generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+			"b2nd decompression failed");
+      else
+	{
+	  u->dbuf_len = nbytes;
+	  u->dbuf_pos = 0;
+	}
+      gfc_b2.b2nd_free (arr);
+      return false;
+    }
+  if (nd_contiguous (desc, elem))
+    buf = GFC_DESCRIPTOR_DATA (desc);
+  else
+    {
+      buf = xmalloc (total);
+      own = true;
+    }
+  if (gfc_b2.b2nd_to_cbuffer (arr, buf, total) < 0)
+    generate_error (&dtp->common, LIBERROR_CORRUPT_FILE,
+		    "b2nd decompression failed");
+  else if (own)
+    nd_scatter (desc, elem, buf);
+  gfc_b2.b2nd_free (arr);
+  if (own)
+    free (buf);
+  return true;
+}
+#endif /* HAVE_BLOSC2 */
+
 void
 transfer_array_inner (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
 		      gfc_charlen_type charlen)
@@ -3452,6 +3781,22 @@ transfer_array_inner (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
 	  return;
 	}
     }
+
+#ifdef HAVE_BLOSC2
+  /* Shape-aware items in compressed sequential files.  */
+  if (dtp->u.p.current_unit && dtp->u.p.current_unit->compress
+      && is_stream_io (dtp) == 0
+      && dtp->u.p.current_unit->flags.access == ACCESS_SEQUENTIAL
+      && dtp->u.p.current_unit->flags.form == FORM_UNFORMATTED
+      && iotype != BT_CHARACTER && iotype != BT_CLASS)
+    {
+      if (dtp->u.p.mode == WRITING && options.compress_layout
+	  && nd_write (dtp, desc, iotype, kind, size))
+	return;
+      if (dtp->u.p.mode == READING && nd_read (dtp, desc, size))
+	return;
+    }
+#endif
 
   stride0 = stride[0];
 
@@ -3769,6 +4114,7 @@ us_read (st_parameter_dt *dtp, int continued)
     {
       dtp->u.p.current_unit->dbuf_len = 0;
       dtp->u.p.current_unit->dbuf_pos = 0;
+      dtp->u.p.current_unit->zhdr_pending = 0;
     }
 
   if (i >= 0)
