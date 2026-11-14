@@ -384,12 +384,18 @@ inquire_via_unit (st_parameter_inquire *iqp, gfc_unit *u)
 	      if ((cf2 & IOPARM_INQUIRE_HAS_ID) != 0)
 		{
 		  int id;
-		  id = *iqp->id;
-		  *iqp->pending = id >= u->au->id.low;
+		  id = *(iqp->id);
+		  *(iqp->pending) = id >= u->au->id.low;
+		  /* PENDING=.false. means the wait operation has been
+		     performed: complete buffered reads.  */
+		  if (!*(iqp->pending))
+		    async_complete_reads (u->au);
 		}
 	      else
 		{
-		  *iqp->pending = !u->au->empty;
+		  *(iqp->pending) = ! u->au->empty;
+		  if (!*(iqp->pending))
+		    async_complete_reads (u->au);
 		}
 	      UNLOCK (&(u->au->lock));
 	    }

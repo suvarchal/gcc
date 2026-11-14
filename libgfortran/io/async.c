@@ -128,7 +128,27 @@ typedef struct transfer_queue
   void *owned;
   size_t owned_bytes;
   size_t owned_cap;
+  /* For a buffered asynchronous READ: the record to mark done.  */
+  struct async_pending_read *pending_read;
 } transfer_queue;
+
+/* A buffered asynchronous READ item: the I/O thread reads into BUF, and
+   the data is copied into the destination (DEST for a scalar item, the
+   array described by DESC otherwise, in array element order) when the
+   program synchronises with WAIT, CLOSE, INQUIRE(PENDING=) or a
+   synchronous statement.  Until then the destination keeps its old
+   value, so a program that looks early never sees a torn mix.  */
+struct async_pending_read
+{
+  void *buf;
+  size_t cap;
+  size_t nbytes;
+  void *dest;
+  gfc_array_char *desc;
+  size_t elem_bytes;
+  bool done;
+  struct async_pending_read *next;
+};
 
 struct error {
   st_parameter_dt *dtp;
@@ -302,6 +322,8 @@ async_io (void *arg)
 	      spare_release (ctq->owned, ctq->owned_cap);
 	      au->copy_bytes_outstanding -= ctq->owned_bytes;
 	    }
+	  if (ctq->pending_read)
+	    ctq->pending_read->done = true;
   	  NOTE ("Next ctq, current id: %d", au->id.low);
   	  if (ctq->has_id && au->id.waiting == au->id.low++)
 	    SIGNAL (&au->id.done);
@@ -335,6 +357,14 @@ free_async_unit (async_unit *au)
   destroy_adv_cond (&au->emptysignal);
   destroy_adv_cond (&au->id.done);
   T_ERROR (__gthread_mutex_destroy, &au->lock);
+  while (au->pending_reads)
+    {
+      struct async_pending_read *pr = au->pending_reads;
+      au->pending_reads = pr->next;
+      free (pr->buf);
+      free (pr->desc);
+      free (pr);
+    }
   free (au);
 }
 
@@ -372,6 +402,7 @@ init_async_unit (gfc_unit *u)
   au->head = NULL;
   au->tail = NULL;
   au->copy_bytes_outstanding = 0;
+  au->pending_reads = NULL;
   au->empty = true;
   au->id.waiting = -1;
   au->id.low = 0;
@@ -387,7 +418,8 @@ init_async_unit (gfc_unit *u)
 
 void
 enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type,
-		  void *owned, size_t owned_bytes, size_t owned_cap)
+		  void *owned, size_t owned_bytes, size_t owned_cap,
+		  struct async_pending_read *pr)
 {
   transfer_queue *tq = calloc (1, sizeof (transfer_queue));
   tq->arg = *arg;
@@ -396,6 +428,7 @@ enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type,
   tq->owned = owned;
   tq->owned_bytes = owned_bytes;
   tq->owned_cap = owned_cap;
+  tq->pending_read = pr;
   LOCK (&au->lock);
   au->copy_bytes_outstanding += owned_bytes;
   if (!au->tail)
@@ -481,7 +514,7 @@ void
 enqueue_data_transfer_init (async_unit *au, st_parameter_dt *dt, int read_flag)
 {
   st_parameter_dt *new = xmalloc (sizeof (st_parameter_dt));
-  transfer_queue *tq = xmalloc (sizeof (transfer_queue));
+  transfer_queue *tq = xcalloc (1, sizeof (transfer_queue));
 
   memcpy ((void *) new, (void *) dt, sizeof (st_parameter_dt));
 
@@ -494,6 +527,8 @@ enqueue_data_transfer_init (async_unit *au, st_parameter_dt *dt, int read_flag)
   tq->new_pdt = new;
   tq->owned = NULL;
   tq->owned_bytes = 0;
+  tq->owned_cap = 0;
+  tq->pending_read = NULL;
   LOCK (&au->lock);
 
   if (!au->tail)
@@ -570,6 +605,7 @@ async_wait_id (st_parameter_common *cmp, async_unit *au, int i)
   WAIT_SIGNAL_MUTEX (&(au->id.done),
 		     (au->id.low > au->id.waiting || au->empty), &au->lock);
   LOCK (&au->lock);
+  async_complete_reads (au);
   ret = collect_async_errors (cmp, au);
   UNLOCK (&au->lock);
   return ret;
@@ -666,6 +702,116 @@ async_copy_mem (void *dst, const void *src, size_t nbytes)
     __gthread_join (tid[i], NULL);
 }
 
+/* Scatter SRC, holding the elements of the array described by DESC in
+   element order, into that array.  Same traversal as async_pack_array in
+   transfer.c.  */
+
+static void
+async_unpack_array (gfc_array_char *desc, size_t elem_bytes, const char *src)
+{
+  index_type count[GFC_MAX_DIMENSIONS];
+  index_type extent[GFC_MAX_DIMENSIONS];
+  index_type stride[GFC_MAX_DIMENSIONS];
+  index_type rank, n, chunk;
+  char *data;
+
+  rank = GFC_DESCRIPTOR_RANK (desc);
+  for (n = 0; n < rank; n++)
+    {
+      count[n] = 0;
+      stride[n] = GFC_DESCRIPTOR_STRIDE_BYTES (desc, n);
+      extent[n] = GFC_DESCRIPTOR_EXTENT (desc, n);
+      if (extent[n] <= 0)
+	return;
+    }
+
+  chunk = stride[0] == (index_type) elem_bytes ? extent[0] : 1;
+  data = GFC_DESCRIPTOR_DATA (desc);
+  while (data)
+    {
+      memcpy (data, src, chunk * elem_bytes);
+      src += chunk * elem_bytes;
+      data += stride[0] * chunk;
+      count[0] += chunk;
+      n = 0;
+      while (count[n] == extent[n])
+	{
+	  count[n] = 0;
+	  data -= stride[n] * extent[n];
+	  n++;
+	  if (n == rank)
+	    {
+	      data = NULL;
+	      break;
+	    }
+	  else
+	    {
+	      count[n]++;
+	      data += stride[n];
+	    }
+	}
+    }
+}
+
+/* Register a buffered asynchronous READ of NBYTES into BUF (capacity CAP)
+   whose destination is DEST, or the array described by DESC (a copy owned
+   by the record) with elements of ELEM_BYTES.  */
+
+struct async_pending_read *
+async_register_read (async_unit *au, void *buf, size_t cap, size_t nbytes,
+		     void *dest, gfc_array_char *desc, size_t elem_bytes)
+{
+  struct async_pending_read *pr = xmalloc (sizeof (*pr));
+  struct async_pending_read **pp;
+  pr->buf = buf;
+  pr->cap = cap;
+  pr->nbytes = nbytes;
+  pr->dest = dest;
+  pr->desc = desc;
+  pr->elem_bytes = elem_bytes;
+  pr->done = false;
+  pr->next = NULL;
+  LOCK (&au->lock);
+  for (pp = &au->pending_reads; *pp; pp = &(*pp)->next)
+    ;
+  *pp = pr;
+  au->copy_bytes_outstanding += nbytes;
+  UNLOCK (&au->lock);
+  return pr;
+}
+
+/* Copy the data of every completed buffered READ into its destination
+   and release the buffers.  Called with au->lock held at the points
+   where the program synchronises with the I/O thread.  Records of items
+   that were skipped because of an error are dropped without a copy.  */
+
+void
+async_complete_reads (async_unit *au)
+{
+  struct async_pending_read **pp = &au->pending_reads;
+  while (*pp)
+    {
+      struct async_pending_read *pr = *pp;
+      if (!pr->done && !au->error.has_error)
+	{
+	  pp = &pr->next;
+	  continue;
+	}
+      if (pr->done)
+	{
+	  if (pr->desc)
+	    async_unpack_array (pr->desc, pr->elem_bytes, pr->buf);
+	  else
+	    memcpy (pr->dest, pr->buf, pr->nbytes);
+	}
+      *pp = pr->next;
+      au->copy_bytes_outstanding -= pr->nbytes;
+      spare_release (pr->buf, pr->cap);
+      free (pr->desc);
+      free (pr);
+    }
+}
+
 /* Assign an ID to a statement on an asynchronous unit that was
    completed synchronously.  */
 
@@ -698,13 +844,17 @@ async_wait (st_parameter_common *cmp, async_unit *au)
 
   if (au->empty)
     {
+      async_complete_reads (au);
       ret = collect_async_errors (cmp, au);
       UNLOCK (&au->lock);
       return ret;
     }
 
   WAIT_SIGNAL_MUTEX (&(au->emptysignal), (au->empty), &au->lock);
+  LOCK (&au->lock);
+  async_complete_reads (au);
   ret = collect_async_errors (cmp, au);
+  UNLOCK (&au->lock);
   return ret;
 }
 
@@ -737,7 +887,23 @@ init_async_unit (gfc_unit *u)
 
 void
 enqueue_transfer (async_unit *au, transfer_args *arg, enum aio_do type,
-		  void *owned, size_t owned_bytes, size_t owned_cap)
+		  void *owned, size_t owned_bytes, size_t owned_cap,
+		  struct async_pending_read *pr)
+{
+  return;
+}
+
+/* Do-nothing function, which will not be called.  */
+struct async_pending_read *
+async_register_read (async_unit *au, void *buf, size_t cap, size_t nbytes,
+		     void *dest, gfc_array_char *desc, size_t elem_bytes)
+{
+  return NULL;
+}
+
+/* Do-nothing function, which will not be called.  */
+void
+async_complete_reads (async_unit *au)
 {
   return;
 }

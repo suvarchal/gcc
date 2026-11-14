@@ -2687,7 +2687,7 @@ async_copy_alloc (st_parameter_dt *dtp, size_t nbytes, size_t *cap)
 
   *cap = 0;
 
-  if (!options.async_copy || dtp->u.p.mode != WRITING || nbytes == 0)
+  if (!options.async_copy || nbytes == 0)
     return NULL;
 
   if (options.async_copy_limit > 0)
@@ -2795,12 +2795,23 @@ wrap_scalar_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
 	  transfer_args args;
 	  void *owned = NULL;
 	  size_t nbytes = 0, cap = 0;
+	  struct async_pending_read *pr = NULL;
 	  if (type != BT_CLASS)
 	    {
 	      nbytes = (type == BT_CHARACTER
 			? size * GFC_SIZE_OF_CHAR_KIND (kind) : size) * n_elem;
 	      owned = async_copy_alloc (dtp, nbytes, &cap);
-	      if (owned)
+	      if (owned && dtp->u.p.mode == READING)
+		{
+		  /* Read into the buffer; copy into P at the WAIT.  */
+		  pr = async_register_read (dtp->u.p.current_unit->au, owned,
+					    cap, nbytes, p, NULL, 0);
+		  p = owned;
+		  owned = NULL;
+		  nbytes = 0;
+		  cap = 0;
+		}
+	      else if (owned)
 		{
 		  async_copy_mem (owned, p, nbytes);
 		  p = owned;
@@ -2813,7 +2824,7 @@ wrap_scalar_transfer (st_parameter_dt *dtp, bt type, void *p, int kind,
 	  args.scalar.s1 = size;
 	  args.scalar.s2 = n_elem;
 	  enqueue_transfer (dtp->u.p.current_unit->au, &args,
-			    AIO_TRANSFER_SCALAR, owned, nbytes, cap);
+			    AIO_TRANSFER_SCALAR, owned, nbytes, cap, pr);
 	  return;
 	}
     }
@@ -3093,12 +3104,25 @@ transfer_array (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
 		nelem *= e > 0 ? e : 0;
 	      }
 	    nbytes = (size_t) nelem * elem_bytes;
+	    struct async_pending_read *pr = NULL;
 	    owned = async_copy_alloc (dtp, nbytes, &cap);
 	    if (owned)
 	      {
 		gfc_array_char *d = args.array.desc;
 		index_type str = 1;
-		async_pack_array (desc, elem_bytes, owned);
+		if (dtp->u.p.mode == READING)
+		  {
+		    /* The I/O thread reads into the contiguous buffer; the
+		       scatter into the user's array happens at the WAIT,
+		       using a copy of the original descriptor.  */
+		    gfc_array_char *orig = xmalloc (sz);
+		    memcpy (orig, desc, sz);
+		    pr = async_register_read (dtp->u.p.current_unit->au,
+					      owned, cap, nbytes, NULL, orig,
+					      elem_bytes);
+		  }
+		else
+		  async_pack_array (desc, elem_bytes, owned);
 		GFC_DESCRIPTOR_DATA (d) = owned;
 		d->offset = 0;
 		d->span = elem_bytes;
@@ -3110,9 +3134,15 @@ transfer_array (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
 		    d->offset -= lb * str;
 		    str *= e;
 		  }
+		if (pr)
+		  {
+		    owned = NULL;
+		    nbytes = 0;
+		    cap = 0;
+		  }
 	      }
 	    enqueue_transfer (dtp->u.p.current_unit->au, &args,
-			      AIO_TRANSFER_ARRAY, owned, nbytes, cap);
+			      AIO_TRANSFER_ARRAY, owned, nbytes, cap, pr);
 	  }
 	  return;
 	}

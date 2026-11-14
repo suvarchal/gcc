@@ -619,6 +619,9 @@ typedef struct async_unit
   struct transfer_queue *tail;
   /* Bytes of copied output (GFORTRAN_ASYNC_COPY) still in the queue.  */
   size_t copy_bytes_outstanding;
+  /* Asynchronous READ items whose data is read into a runtime buffer and
+     copied into the destination at the synchronising WAIT.  */
+  struct async_pending_read *pending_reads;
 
   struct {
     const char *message;
@@ -656,8 +659,17 @@ void async_close (async_unit *);
 internal_proto (async_close);
 
 void enqueue_transfer (async_unit * au, transfer_args * arg, enum aio_do,
-		       void *owned, size_t owned_bytes, size_t owned_cap);
+		       void *owned, size_t owned_bytes, size_t owned_cap,
+		       struct async_pending_read *);
 internal_proto (enqueue_transfer);
+
+struct async_pending_read *async_register_read (async_unit *, void *, size_t,
+						size_t, void *,
+						gfc_array_char *, size_t);
+internal_proto (async_register_read);
+
+void async_complete_reads (async_unit *);
+internal_proto (async_complete_reads);
 
 void enqueue_done (async_unit *, enum aio_do type);
 internal_proto (enqueue_done);
