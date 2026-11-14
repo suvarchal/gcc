@@ -760,8 +760,9 @@ gfc_finish_var_decl (tree decl, gfc_symbol * sym)
 		&& sym->attr.codimension && !sym->attr.allocatable)))
     TREE_STATIC (decl) = 1;
 
-  /* Treat asynchronous variables the same as volatile, for now.  */
-  if (sym->attr.volatile_ || sym->attr.asynchronous)
+  /* Treat asynchronous variables the same as volatile, unless
+     -fno-async-volatile.  */
+  if (sym->attr.volatile_ || (sym->attr.asynchronous && flag_async_volatile))
     {
       TREE_THIS_VOLATILE (decl) = 1;
       TREE_SIDE_EFFECTS (decl) = 1;

@@ -823,6 +823,10 @@ frealloc-lhs
 Fortran Var(flag_realloc_lhs) Init(-1)
 Reallocate the LHS in assignments.
 
+fasync-volatile
+Fortran Var(flag_async_volatile) Init(1)
+Treat variables with the ASYNCHRONOUS attribute as volatile.
+
 frecord-marker=4
 Fortran RejectNegative Var(flag_record_marker,4)
 Use a 4-byte record marker for unformatted files.

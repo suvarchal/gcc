@@ -202,6 +202,7 @@ and warnings}.
 -fmax-stack-var-size=@var{n} -fno-align-commons -fno-automatic
 -fno-protect-parens -fno-underscoring -fsecond-underscore
 -fpack-derived -frealloc-lhs -frecursive -frepack-arrays
+-fasync-volatile
 -fshort-enums -fstack-arrays
 }
 
@@ -2238,6 +2239,23 @@ An allocatable left-hand side of an intrinsic assignment is automatically
 (re)allocated if it is either unallocated or has a different shape. The
 option is enabled by default except when @option{-std=f95} is given. See
 also @option{-Wrealloc-lhs}.
+
+@opindex fasync-volatile
+@cindex ASYNCHRONOUS attribute, code generation
+@item -fasync-volatile
+Variables with the @code{ASYNCHRONOUS} attribute are compiled as if they
+were @code{VOLATILE}: every access is a memory access, and loops over
+them are neither vectorized nor otherwise optimized across iterations.
+This is the default.  With @option{-fno-async-volatile} such variables
+are compiled like any other variable.  This is safe with the GNU Fortran
+runtime library, whose pending asynchronous input/output touches a
+variable only between the data transfer statement and the matching
+@code{WAIT}, @code{INQUIRE} or @code{CLOSE}, during which a conforming
+program does not access the variable, and the variable's address has
+been passed to the library so the compiler does not keep its value
+across those calls.  It can make loops over large asynchronous arrays
+substantially faster.  The option does not change the treatment of
+variables that are actually declared @code{VOLATILE}.
 
 @opindex faggressive-function-elimination
 @cindex Elimination of functions with identical argument lists
