@@ -2826,7 +2826,7 @@ transfer_array_inner (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
   index_type count[GFC_MAX_DIMENSIONS];
   index_type extent[GFC_MAX_DIMENSIONS];
   index_type stride[GFC_MAX_DIMENSIONS];
-  index_type stride0, rank, size, n;
+  index_type stride0, rank, size, n, s, e;
   size_t tsize;
   char *data;
   bt iotype;
@@ -2839,23 +2839,33 @@ transfer_array_inner (st_parameter_dt *dtp, gfc_array_char *desc, int kind,
   iotype = (bt) GFC_DESCRIPTOR_TYPE (desc);
   size = iotype == BT_CHARACTER ? charlen : GFC_DESCRIPTOR_SIZE (desc);
 
-  rank = GFC_DESCRIPTOR_RANK (desc);
-
-  for (n = 0; n < rank; n++)
+  rank = 0;
+  for (n = 0; n < GFC_DESCRIPTOR_RANK (desc); n++)
     {
-      count[n] = 0;
-      stride[n] = GFC_DESCRIPTOR_STRIDE_BYTES(desc,n);
-      extent[n] = GFC_DESCRIPTOR_EXTENT(desc,n);
+      s = GFC_DESCRIPTOR_STRIDE_BYTES(desc,n);
+      e = GFC_DESCRIPTOR_EXTENT(desc,n);
 
       /* If the extent of even one dimension is zero, then the entire
 	 array section contains zero elements, so we return after writing
 	 a zero array record.  */
-      if (extent[n] <= 0)
+      if (e <= 0)
 	{
 	  data = NULL;
 	  tsize = 0;
 	  dtp->u.p.transfer (dtp, iotype, data, kind, size, tsize);
 	  return;
+	}
+
+      /* A dimension that continues the contiguous leading block is
+	 merged into it, so that it is transferred in one piece.  */
+      if (rank == 1 && stride[0] == size && s == size * extent[0])
+	extent[0] *= e;
+      else
+	{
+	  count[rank] = 0;
+	  stride[rank] = s;
+	  extent[rank] = e;
+	  rank++;
 	}
     }
 
